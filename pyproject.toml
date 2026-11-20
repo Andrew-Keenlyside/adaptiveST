@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptiveST"
+version = "0.1.0"
+description = "3D structure tensors with per-voxel adaptive derivative and integration scales"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda12x"]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["adaptivest"]
+
+[tool.pytest.ini_options]
+markers = ["gpu: needs cupy and a CUDA device"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
