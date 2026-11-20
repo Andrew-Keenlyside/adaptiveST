@@ -94,6 +94,18 @@ log ρ; the noise model's fitting band; how many calibration blocks.
 
 ## Example: 20 µm HiP-CT (human brain, deep grey and white matter)
 
+![Fixed against adaptive scales on 20 µm HiP-CT](docs/results.png)
+
+*A 96³ block (1.9 mm) of human brain at 20 µm, computed inside a larger volume so that
+every window sees real tissue. Rows: axial, coronal and sagittal slices. Columns:
+the image; the adaptive σ(x) and ρ(x) maps; direction-encoded colour (R = x, G = y,
+B = z) at fixed σ 1, ρ 3; at fixed scales equal to the maps' means (σ 0.80, ρ 6.3);
+and with adaptive σ(x), ρ(x) (θ = 15°, `rho_max` = 16, Gaussian noise). At ρ 3 the
+direction field is mostly noise. The mean window removes it but runs fixed-width
+blur through every structure, leaving sharp singular points where it straddles two.
+The adaptive field keeps the same large-scale organisation and resolves smaller
+domains where the image supports a smaller window.*
+
 On a 384³ crop at 20 µm, with θ = 15° and `rho_max` = 16:
 
 - **σ** stays near 0.75–0.85 voxels almost everywhere: the finest texture is at the
@@ -139,6 +151,10 @@ Lowering `rho_max` cuts all three.
   precise direction even when that direction is the speck's or the edge's.
 - **Bias is not modelled.** The rule limits noise only; a large window in weak texture
   can still average across neighbouring structures.
+- **Near a volume's faces the windows see edge replication, not tissue.** Within
+  about the halo (94 voxels at `rho_max` 16) of the faces, the large windows the
+  method picks average padded values. Compute on a larger volume than you need, or
+  lower `rho_max`.
 - **Scalars from the adaptive tensor change meaning with the scales.** FA and
   linearity are computed over windows that differ from voxel to voxel.
 
