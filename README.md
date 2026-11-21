@@ -88,13 +88,22 @@ default), with no noise model and nothing sampled from elsewhere in the volume.
   coefficient count, `B = ⌈2π·rho_max⌉` (the block that resolves the largest window's
   frequencies), from the window's spectral resolution to the corner of the cube
   (√3/2 cycles/voxel). Equal counts give every band the same statistical precision.
-- **The noise power in a band** is the smallest band power among the window's 32³
-  sub-windows, corrected for the bias of a minimum over noisy estimates (the expected
-  minimum of N Gamma variables; Martin's minimum statistics). Signal and noise are
-  uncorrelated, so a band never holds less power than its noise. Where tissue texture
-  is patchy, the quietest sub-window holds little else. The log of the minimum is
-  averaged over the window (a Gaussian, s.d. a sixth of it, cut at 3 s.d.), so the
-  maps are smooth, and capped at the window's mean band power.
+- **The noise power in a band** is the smallest band power among the 4³ sub-windows
+  (32³ voxels each) that tile the window, corrected for the bias of a minimum over
+  noisy estimates (the expected minimum of N Gamma variables; Martin's minimum
+  statistics). Signal and noise are uncorrelated, so a band never holds less power
+  than its noise. Where tissue texture is patchy, the quietest sub-window holds little
+  else. The log of the minimum is averaged over the window (a Gaussian, s.d. a sixth
+  of it, cut at 3 s.d.), so the maps are smooth, and capped at the window's mean band
+  power.
+- **The level correction.** Real noise is not equally strong everywhere in a window
+  (±20% between sub-windows in LADAF's medium), and a plain minimum then picks a
+  quieter spot and reads low. So each sub-window's band power is first divided by its
+  own noise level: its power above 0.5 cycles/voxel (beyond the Nyquist frequency of
+  every axis), relative to the window's. The minimum is scaled back by the window's
+  mean level. This assumes the level varies alike at all frequencies and that the
+  image has noise above 0.5 cycles/voxel (an upsampled or low-pass filtered image
+  does not).
 - **The noise layer** is one draw of Gaussian noise with that spectrum: white noise
   split into the same bands, each band scaled at each voxel to its local noise power.
 - **K(x).** The tensor is computed on the image and on the image plus the layer, at
@@ -108,19 +117,25 @@ default), with no noise model and nothing sampled from elsewhere in the volume.
 an independent noise reference (its spectrum, scaled to each tissue window's
 high-frequency plateau). Against it:
 
+- In windows of pure medium, the gradient noise at σ 0.5 comes out 0.88–0.98 of the
+  window's own power (0.74–0.85 without the level correction), and 0.99 on synthetic
+  stationary noise with the medium's spectrum. Adding synthetic noise of known power
+  to any window raises the estimate by 1.00–1.06 of that power.
 - Above about 0.55 cycles/voxel, where tissue has no signal left, the local estimate
-  agrees to within about 10%.
+  agrees with the reference to within about 5%.
 - Next to the medium (a window that includes some), the quietest sub-window is the
-  medium, and the gradient noise at σ 0.5 comes out 1.26× the reference.
+  medium, and the gradient noise at σ 0.5 comes out 1.45× the reference.
 - In dense deep grey matter there is no quiet sub-window at 0.1–0.4 cycles/voxel:
-  texture is counted as noise, 2.7× the reference in gradient noise power at σ 0.5.
-  ρ comes out about a third larger (1.34×) and directions shift by about 6° (median)
-  against using the medium's spectrum.
+  texture is counted as noise, about 2.6× the reference in gradient noise power at
+  σ 0.5. Before the level correction (2.3–2.4× there) ρ came out about a third larger
+  and directions shifted by about 6° (median) against using the medium's spectrum.
 
-So the local estimate is an upper bound on the noise: exact where a window holds
-something noise-only, too large in dense texture. Without a noise-only region in the
-scan, or half-reconstructions, a single window cannot tell texture from noise any
-better.
+So the local estimate is the power common to every sub-window of a window. It is the
+noise where noise dominates or some sub-window is free of structure, and too large
+where texture or a regular fibre array fills the whole window: on synthetic uniform
+tubes whose noise is 4% of the gradient power it reads about 9× the true
+noise. Without a noise-only region in the scan, or half-reconstructions, a single
+window cannot tell uniform texture from noise any better.
 
 **Chunking** changes the result only statistically: each tile measures the window
 statistics from its own context, with its own noise draw.
@@ -168,9 +183,9 @@ structure, such as white matter, so the tensor sees only its own fibres' gradien
 *A sagittal 128³ core of I74 at 20 µm, on the edge of the internal capsule, computed
 without a mask (A) and with a white-matter mask (B; intensity smoothed at 3 voxels,
 above its Otsu threshold of 159). Far from the mask's edge nothing changes: more than
-40 voxels in, ρ is 4.1 in both and the direction moves 0.0° (median; 0.2° at the 90th
+40 voxels in, ρ is 4.2 in both and the direction moves 0.0° (median; 0.1° at the 90th
 percentile). Within 5 voxels of the edge, A's tensor is steered by the edge's own
-contrast: a smaller window (ρ 7.5 against 12.1) and a direction 6.0° away (median;
+contrast: a smaller window (ρ 7.8 against 13.1) and a direction 6.0° away (median;
 26° at the 90th percentile). The vessels inside the white matter are masked out in
 the same way.*
 
@@ -223,17 +238,17 @@ by image intensity. θ = 15°, `rho_max` = 16, default settings, nothing calibra
 
 | | noise share (5–95%) | ρ median (10–90%) | σ median | at `rho_max` |
 |---|---|---|---|---|
-| I74 20 µm, striatum | 0.52–0.76 | 3.4 (2.0–6.2) | 0.75 | 0% |
-| I74 20 µm, white matter | 0.57–0.82 | 4.5 (2.7–6.1) | 0.73 | 0% |
-| I74 10 µm | 0.79–0.91 | 7.9 (4.8–11.9) | 0.99 | 0.2% |
-| I74 2.2 µm | 0.81–0.89 | 12.7 (6.8–16) | 1.39 | 17% |
-| LADAF 23.4 µm | 0.63–0.83 | 3.7 (2.3–6.3) | 0.77 | 0% |
+| I74 20 µm, striatum | 0.60–0.84 | 3.5 (2.0–6.4) | 0.75 | 0% |
+| I74 20 µm, white matter | 0.66–0.94 | 4.8 (2.8–6.4) | 0.73 | 0% |
+| I74 10 µm | 0.84–0.95 | 8.4 (5.1–12.5) | 0.99 | 0.5% |
+| I74 2.2 µm | 0.85–0.95 | 13.3 (7.2–16) | 1.39 | 22% |
+| LADAF 23.4 µm | 0.69–0.87 | 3.8 (2.3–6.5) | 0.77 | 0% |
 
 - **At 20–23 µm, ρ is close to the earlier calibrated version** (3.4, 4.0 and 3.8
   there), with the noise varying smoothly across each core.
 - **The fine VOIs get much larger windows** than with the earlier calibrated `K`
   (4.7 and 7.3 there). Most of their gradient power at σ 0.5 is counted as noise
-  (86%), and at 2.2 µm 17% of the core reaches `rho_max`. These VOIs are all tissue,
+  (90–92%), and at 2.2 µm 22% of the core reaches `rho_max`. These VOIs are all tissue,
   with no noise-only region in any window, so this is where the local estimate is
   most likely to count fine texture as noise (see the limitations).
 
@@ -258,12 +273,18 @@ Lowering `rho_max` or `noise_window` cuts all three.
 
 ## Limitations
 
-- **Dense fine texture is counted as noise.** The local estimate is an upper bound: in
-  deep grey matter, where no sub-window is free of texture at 0.1–0.4 cycles/voxel,
-  it overstates the gradient noise at σ 0.5 by about 2.7× (LADAF-2021-17, against the
-  medium's spectrum), and ρ by about a third. Where a window includes something
-  noise-only (medium, a ventricle) it is close. Odd/even projection
-  half-reconstructions would give the true local noise.
+- **Texture or structure that fills a window is counted as noise.** The local estimate
+  is the power common to every sub-window: in deep grey matter, where no sub-window is
+  free of texture at 0.1–0.4 cycles/voxel, it overstates the gradient noise at σ 0.5
+  by about 2.6× (LADAF-2021-17, against the medium's spectrum), and ρ by about a
+  third. A regular fibre array filling the window is counted too. Where a window
+  includes something noise-only (medium, a ventricle) it is close. Odd/even
+  projection half-reconstructions would give the true local noise.
+- **`K` is unreliable near a volume's edges on the GPU.** Where a tile is
+  edge-replicated along two axes the padded image has no direction, and those voxels'
+  perturbation factors dominate `K`'s ratio of sums: `K` falls towards zero and ρ to
+  its minimum within the noise window's reach of an edge where two faces meet. The CPU
+  result differs there. Interior voxels are unaffected.
 - **The noise layer is isotropic within each band.** Noise that is stronger along one
   axis (CT streaks; on LADAF the medium's noise is 0.5–1.5× the mean along different
   axes) is drawn equally in all directions.

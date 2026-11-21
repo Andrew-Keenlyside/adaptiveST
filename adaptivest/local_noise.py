@@ -4,14 +4,23 @@ Nothing here samples the rest of the volume or uses a noise model: a voxel's val
 its window and, through the window's averaging, the windows around it (at most a window's width away).
 
 **The noise spectrum at x.** The window around x (``noise_window`` voxels, 128 by
-default) is split into frequency bands. In each band, the noise power is the
-smallest band power among the window's sub-windows (a quarter of its width:
-32³), corrected for the bias of a minimum over noisy estimates (Martin 2001: the
-expected minimum of N Gamma variables). Signal and noise are uncorrelated, so a
-band's power can never be less than its noise; where tissue texture is patchy, the
-quietest sub-window holds little else. The log of that minimum is then averaged
-over the window (a Gaussian, s.d. a sixth of it, cut at 3 s.d.), so the maps are
-smooth, and capped at the window's mean band power.
+default) is split into frequency bands and tiled by 4³ sub-windows (a quarter of
+its width: 32³). In each band, the noise power is the smallest band power among
+the sub-windows, corrected for the bias of a minimum over noisy estimates (Martin
+2001: the expected minimum of N Gamma variables). Signal and noise are
+uncorrelated, so a band's power can never be less than its noise; where tissue
+texture is patchy, the quietest sub-window holds little else. The log of that
+minimum is then averaged over the window (a Gaussian, s.d. a sixth of it, cut at
+3 s.d.), so the maps are smooth, and capped at the window's mean band power.
+
+**The level correction.** Real noise is not equally strong everywhere in a window,
+and a plain minimum then picks a quieter spot and reads low. So each sub-window's
+band power is first divided by its noise level: its power above 0.5 cycles/voxel
+(beyond the Nyquist frequency of every axis, where an image sampled at or above
+its resolution holds noise only), relative to the window's. The minimum is taken
+over these and scaled back by the window's mean level. This assumes the level
+varies alike at all frequencies, and that the image has noise above 0.5
+cycles/voxel (an upsampled or low-pass filtered image does not).
 
 **Bands.** ``B/2`` bands of equal coefficient count, ``B = ceil(2 pi rho_max)``
 (the block that resolves the largest window's frequencies), from the window's
@@ -51,6 +60,10 @@ from .adaptive import (
     perturbation_factor,
     smallest_eigvec,
 )
+
+#: Frequencies (cycles/voxel) above this are the sub-windows' noise-level reference: beyond the Nyquist
+#: frequency of every axis, in the cube's corners only.
+LEVEL_BAND = 0.5
 
 #: The noise draw's seed: fixed, so a run is reproducible on the CPU and the GPU alike.
 SEED = 0
@@ -105,6 +118,26 @@ def _expected_min(n: int, m: float) -> float:
 
     m = max(float(m), 0.5)
     return float(quad(lambda x: gammaincc(m, m * x) ** n, 0, np.inf, limit=200)[0])
+
+
+def _tile_min(a, q: int, n: int, xp):
+    """At each cell, the minimum of *a* over the ``n³`` positions ``q`` cells apart that tile the window
+    around it (edges clamped)."""
+    offs = [int(round((i - (n - 1) / 2.0) * q)) for i in range(n)]
+    pad = max(abs(o) for o in offs)
+    for ax in range(3):
+        if pad == 0:
+            break
+        w = [(0, 0)] * 3
+        w[ax] = (pad, pad)
+        p = xp.pad(a, w, mode="edge")
+        m = None
+        for o in offs:
+            sl = [slice(None)] * 3
+            sl[ax] = slice(pad + o, pad + o + a.shape[ax])
+            m = p[tuple(sl)] if m is None else xp.minimum(m, p[tuple(sl)])
+        a = m
+    return a
 
 
 def _interp_matrix(n_out: int, n_cells: int, c: int, xp, lo: int = 0):
@@ -187,23 +220,33 @@ class LocalNoise:
         )
         self.frac = np.asarray(counts[1:].get() if xp is not np else counts[1:], float) / N
         cells = tuple(n // c for n in pshape)
-        q, reach, n_ind = L // c, int((W / 2 - L / 2) // c), int(round((W / L) ** 3))
+        q, n_side = L // c, int(round(W / L))
         sw = W / 6.0 / c
         gw = lambda a: gaussian_filter(a, sw, mode="nearest", truncate=3.0)  # noqa: E731
-        Pn, Pt = [], []
+        box = lambda a, n: ndi.uniform_filter(a, n, mode="nearest") if n > 1 else a  # noqa: E731
+        E = []
         for b in range(nb):
             band = xp.fft.irfftn(F * (shell == b), s=pshape, axes=(0, 1, 2)).astype(xp.float32)
-            e = _bsum(band * band, c) / float(c**3)
+            E.append(_bsum(band * band, c) / float(c**3))
             del band
-            sub = ndi.uniform_filter(e, q, mode="nearest") if q > 1 else e
-            mn = ndi.minimum_filter(sub, 2 * reach + 1, mode="nearest")
-            mn = mn / _expected_min(n_ind, L**3 * self.frac[b] / 2.0)
+        del F
+        # each sub-window's noise level: its power above the axes' Nyquist frequency, relative to the window's
+        ref = sum(E[b] for b in ([b for b in range(nb) if edges[b] >= LEVEL_BAND] or [nb - 1]))
+        refsub = box(ref, q)
+        refsub = xp.maximum(refsub, 1e-12 * float(xp.maximum(refsub.max(), 1e-30)))
+        refwin = box(ref, q * n_side)
+        del ref
+        Pn, Pt = [], []
+        for b in range(nb):
+            e = E[b]
+            mn = _tile_min(box(e, q) / refsub, q, n_side, xp) * refwin
+            mn = mn / _expected_min(n_side**3, L**3 * self.frac[b] / 2.0)
             tot = gw(e)
             floor = 1e-12 * float(xp.maximum(tot.max(), 1e-30))
             Pn.append(xp.minimum(xp.exp(gw(xp.log(xp.maximum(mn, floor)))), tot))
             Pt.append(tot)
-            del e, sub, mn
-        del F
+            del e, mn
+        del E
         self.Pn, self.Pt, self.cells, self.shell, self.nb = xp.stack(Pn), xp.stack(Pt), cells, shell, nb
         self.up = Upsampler(pshape, cells, c, xp)
 
