@@ -1,6 +1,6 @@
 """Fixed against adaptive scales on a volume: DEC slices and the scale maps.
 
-    python examples/compare_fixed_adaptive.py VOLUME.npy [--threshold T] [--sigma 1 --rho 3] [--gpu]
+    python examples/compare_fixed_adaptive.py VOLUME.npy [--threshold T] [--sigma 1 --rho 3] [--cpu]
 
 VOLUME is a (Z, Y, X) .npy (or any array np.load returns). Writes compare.png beside it.
 """
@@ -19,16 +19,16 @@ p.add_argument("--sigma", type=float, default=1.0)
 p.add_argument("--rho", type=float, default=3.0)
 p.add_argument("--precision", type=float, default=15.0)
 p.add_argument("--rho-max", type=float, default=16.0)
-p.add_argument("--noise", default="gaussian", choices=["gaussian", "poisson"])
-p.add_argument("--chunk", type=int, default=128)
-p.add_argument("--gpu", action="store_true")
+p.add_argument("--noise-window", type=float, default=128.0)
+p.add_argument("--chunk", default="auto", type=lambda v: v if v == "auto" else int(v))
+p.add_argument("--cpu", action="store_true", help="force the CPU (default: the GPU when there is one)")
 a = p.parse_args()
 vol = np.load(a.volume, mmap_mode="r")
-fixed = ast.eigen(ast.structure_tensor(np.asarray(vol), a.sigma, a.rho, gpu=a.gpu))
-scales = ast.calibrate(
-    vol, threshold=a.threshold, precision_deg=a.precision, rho_max=a.rho_max, noise_model=a.noise, log=print
+fixed = ast.eigen(ast.structure_tensor(np.asarray(vol), a.sigma, a.rho, gpu=False if a.cpu else None))
+scales = ast.AdaptiveScales(precision_deg=a.precision, rho_max=a.rho_max, noise_window=a.noise_window)
+S, maps = ast.adaptive_structure_tensor(
+    vol, scales, threshold=a.threshold, chunk=a.chunk, gpu=False if a.cpu else None, return_maps=True
 )
-S, maps = ast.adaptive_structure_tensor(vol, scales, chunk=a.chunk, gpu=a.gpu, return_maps=True)
 adapt = ast.eigen(S)
 
 import matplotlib  # noqa: E402

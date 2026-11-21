@@ -1,4 +1,4 @@
-"""The fixed-scale 3D structure tensor and its eigen-analysis (numpy, or cupy when ``gpu=True``)."""
+"""The fixed-scale 3D structure tensor and its eigen-analysis (cupy on a CUDA GPU when there is one, else numpy)."""
 
 from __future__ import annotations
 
@@ -11,8 +11,21 @@ COMPONENTS = ("zz", "yy", "xx", "zy", "zx", "yx")
 _PRODUCTS = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
 
 
-def backend(gpu: bool = False):
-    """``(xp, gaussian_filter)``: numpy and scipy's filter, or cupy and cupyx's."""
+def gpu_available() -> bool:
+    """Whether cupy imports and sees a CUDA device."""
+    try:
+        import cupy
+
+        return cupy.cuda.runtime.getDeviceCount() > 0
+    except Exception:  # noqa: BLE001 - no cupy, no driver, no device: all mean CPU
+        return False
+
+
+def backend(gpu: bool | None = None):
+    """``(xp, gaussian_filter)``: cupy and cupyx's filter (*gpu* True, or None with a GPU present), or
+    numpy and scipy's."""
+    if gpu is None:
+        gpu = gpu_available()
     if gpu:
         import cupy
         from cupyx.scipy.ndimage import gaussian_filter
@@ -54,17 +67,18 @@ def tensor_from_gradients(grads, rho, truncate, gaussian_filter, xp, dtype=None)
 
 
 def structure_tensor(
-    volume, sigma: float = 1.0, rho: float = 3.0, *, truncate: float = 3.0, gpu: bool = False
+    volume, sigma: float = 1.0, rho: float = 3.0, *, truncate: float = 3.0, gpu: bool | None = None
 ):
     """The structure tensor at fixed scales: ``(6, Z, Y, X)`` float32, order :data:`COMPONENTS`.
 
     *sigma*: the derivative (gradient) scale; *rho*: the integration window;
     both Gaussian standard deviations in voxels. Volume edges are handled as
-    ``mode="nearest"``. Returned on the host (numpy) either way.
+    ``mode="nearest"``. Runs on the GPU when there is one (*gpu* None), or as
+    *gpu* says; returned on the host (numpy) either way.
     """
     xp, gf = backend(gpu)
     S = tensor_from_gradients(gradients(volume, sigma, truncate, gf, xp), rho, truncate, gf, xp)
-    return S.get() if gpu else S
+    return S if xp is np else S.get()
 
 
 def eigvals_sym3(S, xp=np):
@@ -92,7 +106,8 @@ def eigen(S, *, slab: int = 16) -> dict:
 
     Returns a dict of ``values`` (3, ...) descending, ``direction`` (3, ...) the
     smallest-eigenvalue eigenvector in (z, y, x) components (the fibre
-    direction: the direction the image does not change along; sign arbitrary),
+    direction: the direction the image does not change along; sign arbitrary;
+    NaN where the tensor is zero),
     ``fa``, ``linearity`` ``(l2 - l3)/l1`` (tube-like: two strong gradient
     directions) and ``planarity`` ``(l1 - l2)/l1`` (edge- or sheet-like).
     """
@@ -109,6 +124,7 @@ def eigen(S, *, slab: int = 16) -> dict:
         w, v = np.linalg.eigh(M)
         vals[:, sl] = np.moveaxis(w[..., ::-1], -1, 0)
         vec[:, sl] = np.moveaxis(v[..., :, 0], -1, 0)
+    vec[:, ~(vals.sum(0) > 0)] = np.nan  # a zero tensor (masked out, or flat image) has no direction
     l1, l2, l3 = vals
     m = vals.mean(0)
     with np.errstate(invalid="ignore", divide="ignore"):
