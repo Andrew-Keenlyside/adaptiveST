@@ -271,6 +271,109 @@ def smallest_eigvec(S, l3, xp):
 
 
 # ---------------------------------------------------------------------------
+# The per-voxel eigen steps fused into one GPU kernel each
+# ---------------------------------------------------------------------------
+# The same arithmetic as eigvals_sym3, perturbation_factor and smallest_eigvec, in the same order and
+# precision, without contracting to FMA: one pass per voxel instead of ~40 kernels and their float64
+# temporaries. Used on cupy arrays; numpy runs the functions above.
+
+_FUSED_PREAMBLE = r"""
+__device__ __forceinline__ void eig3(float s0, float s1, float s2, float s3, float s4, float s5,
+                                     double& l1, double& l2, double& l3) {
+    double a11 = s0, a22 = s1, a33 = s2, a12 = s3, a13 = s4, a23 = s5;
+    double p1 = a12 * a12 + a13 * a13 + a23 * a23;
+    double q = (a11 + a22 + a33) / 3.0;
+    double b11 = a11 - q, b22 = a22 - q, b33 = a33 - q;
+    double p2 = b11 * b11 + b22 * b22 + b33 * b33 + 2.0 * p1;
+    double p = sqrt(p2 / 6.0);
+    bool safe = p > 1e-300;
+    double inv = safe ? 1.0 / (safe ? p : 1.0) : 0.0;
+    double c11 = b11 * inv, c22 = b22 * inv, c33 = b33 * inv, c12 = a12 * inv, c13 = a13 * inv, c23 = a23 * inv;
+    double det = c11 * (c22 * c33 - c23 * c23) - c12 * (c12 * c33 - c23 * c13) + c13 * (c12 * c23 - c22 * c13);
+    double r = det / 2.0;
+    r = r < -1.0 ? -1.0 : (r > 1.0 ? 1.0 : r);
+    double phi = acos(r) / 3.0;
+    l1 = q + 2.0 * p * cos(phi);
+    l3 = q + 2.0 * p * cos(phi + %(third)r);
+    l2 = 3.0 * q - l1 - l3;
+}
+__device__ __forceinline__ double nmax(double a, double b) {  // numpy's maximum: NaN propagates
+    return (a > b || isnan(a)) ? a : b;
+}
+__device__ __forceinline__ double pfactor(double l1, double l2, double l3) {
+    double eps = 1e-12 * nmax(fabs(l1), 1e-300);
+    double d1 = nmax(l1 - l3, eps), d2 = nmax(l2 - l3, eps);
+    return (l1 + l3) / pow(d1, 2.0) + (l2 + l3) / pow(d2, 2.0);
+}
+__device__ __forceinline__ void evec3(float s0, float s1, float s2, float s3, float s4, float s5, float l3,
+                                      float& o0, float& o1, float& o2) {
+    float a0 = s0 - l3, a1 = s1 - l3, a2 = s2 - l3;
+    // rows (a0, zy, zx), (zy, a1, yx), (zx, yx, a2); cross products 01, 02, 12
+    float c[3][3] = {
+        {s3 * s5 - s4 * a1, s4 * s3 - a0 * s5, a0 * a1 - s3 * s3},
+        {s3 * a2 - s4 * s5, s4 * s4 - a0 * a2, a0 * s5 - s3 * s4},
+        {a1 * a2 - s5 * s5, s5 * s4 - s3 * a2, s3 * s5 - a1 * s4}};
+    int best = 0;
+    float bn = powf(c[0][0], 2.0f) + powf(c[0][1], 2.0f) + powf(c[0][2], 2.0f);
+    for (int j = 1; j < 3; ++j) {
+        float n = powf(c[j][0], 2.0f) + powf(c[j][1], 2.0f) + powf(c[j][2], 2.0f);
+        if (isnan(bn)) break;  // numpy's argmax: the first NaN wins
+        if (n > bn || isnan(n)) { bn = n; best = j; }
+    }
+    float norm = sqrtf(powf(c[best][0], 2.0f) + powf(c[best][1], 2.0f) + powf(c[best][2], 2.0f)) + 1e-30f;
+    o0 = c[best][0] / norm; o1 = c[best][1] / norm; o2 = c[best][2] / norm;
+}
+""" % {"third": 2.0 * math.pi / 3.0}
+
+_S6 = "float32 s0, float32 s1, float32 s2, float32 s3, float32 s4, float32 s5"
+_KERNELS = {}
+
+
+def _kernel(name):
+    """The fused cupy kernel *name* (compiled once)."""
+    if name not in _KERNELS:
+        import cupy
+
+        body, params, outs = {
+            # V = clip(K * S, 1e-8, V_RANDOM), V_RANDOM where not finite
+            "variance": (
+                "double l1, l2, l3; eig3(s0, s1, s2, s3, s4, s5, l1, l2, l3);"
+                "double v = (double)kk * pfactor(l1, l2, l3);"
+                "v = v < 1e-8 ? 1e-8 : (v > %(vr)r ? %(vr)r : v);"
+                "out = isfinite(v) ? (float)v : (float)%(vr)r;" % {"vr": V_RANDOM},
+                _S6 + ", T kk",
+                "float32 out",
+            ),
+            # the smallest eigenvector and the perturbation factor
+            "directions": (
+                "double l1, l2, l3; eig3(s0, s1, s2, s3, s4, s5, l1, l2, l3);"
+                "sf = (float)pfactor(l1, l2, l3);"
+                "evec3(s0, s1, s2, s3, s4, s5, (float)l3, e0, e1, e2);",
+                _S6,
+                "float32 e0, float32 e1, float32 e2, float32 sf",
+            ),
+            # theta^2 between the smallest eigenvector and (f0, f1, f2)
+            "angle2": (
+                "double l1, l2, l3; eig3(s0, s1, s2, s3, s4, s5, l1, l2, l3);"
+                "float e0, e1, e2; evec3(s0, s1, s2, s3, s4, s5, (float)l3, e0, e1, e2);"
+                "float dot = fabsf(f0 * e0 + f1 * e1 + f2 * e2);"
+                "dot = dot < 0.0f ? 0.0f : (dot > 1.0f ? 1.0f : dot);"
+                "th2 = powf(acosf(dot), 2.0f);",
+                _S6 + ", float32 f0, float32 f1, float32 f2",
+                "float32 th2",
+            ),
+        }[name]
+        _KERNELS[name] = cupy.ElementwiseKernel(
+            params, outs, body, f"adaptivest_{name}", preamble=_FUSED_PREAMBLE, options=("--fmad=false",)
+        )
+    return _KERNELS[name]
+
+
+def _fused(xp) -> bool:
+    return xp is not np
+
+
+# ---------------------------------------------------------------------------
 # The per-tile passes
 # ---------------------------------------------------------------------------
 
@@ -284,8 +387,12 @@ def _variance_at(grads, k_index, kk, scales, gaussian_filter, xp, support=None):
     """
     t = scales.truncate
     S = _tensor(grads, scales.rho_grid[k_index], t, gaussian_filter, xp, xp.float32, support)
-    V = xp.empty(S.shape[1:], dtype=xp.float32)
     per_voxel = getattr(kk, "ndim", 0) > 0
+    if _fused(xp):
+        V = _kernel("variance")(*S, kk if per_voxel else float(kk))
+        del S
+        return gaussian_filter(V, V_SMOOTH, mode="nearest", truncate=t)
+    V = xp.empty(S.shape[1:], dtype=xp.float32)
     for z in range(0, V.shape[0], SLAB):
         sl = slice(z, z + SLAB)
         l1, l2, l3 = eigvals_sym3(S[:, sl], xp)

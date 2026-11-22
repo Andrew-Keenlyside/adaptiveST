@@ -54,7 +54,9 @@ from .adaptive import (
     SIGMA0,
     SLAB,
     V_RANDOM,
+    _fused,
     _gradients,
+    _kernel,
     _radius,
     eigvals_sym3,
     perturbation_factor,
@@ -299,6 +301,9 @@ def _lattice_tensor(grads, r, d, truncate, gaussian_filter, xp, crop=None):
 
 def _directions(S, xp, want_s=False):
     """Smallest eigenvectors (3 arrays) of *S* (6, ...), and the perturbation factor when *want_s*."""
+    if _fused(xp):
+        *e, Sf = _kernel("directions")(*S)
+        return e, (Sf if want_s else None)
     e = [xp.empty(S.shape[1:], dtype=xp.float32) for _ in range(3)]
     Sf = xp.empty(S.shape[1:], dtype=xp.float32) if want_s else None
     for z in range(0, S.shape[1], SLAB):
@@ -310,6 +315,53 @@ def _directions(S, xp, want_s=False):
             a[sl] = v
         del l1, l2, l3
     return e, Sf
+
+
+def _lattice_step(r, c):
+    """The lattice step K's tensor at window *r* is computed on: 1, 2 or 4 voxels, dividing the cell *c*."""
+    d = 1 if r < 2.8 else (2 if r < 8 else 4)
+    d = min(d, c)
+    while c % d:
+        d //= 2
+    return d
+
+
+def _presmoothed(grads, d, truncate, gaussian_filter, xp):
+    """The 6 gradient products pre-smoothed at d/2 and subsampled every *d*-th voxel (the first step of
+    :func:`_lattice_tensor`, shared by every rho on that lattice)."""
+    out = []
+    for p, q in _PRODUCTS:
+        prod = grads[p] * grads[q]
+        out.append(xp.ascontiguousarray(gaussian_filter(prod, d / 2.0, mode="nearest", truncate=truncate)[::d, ::d, ::d]))
+        del prod
+    return out
+
+
+def _lattice_finish(pre, r, d, truncate, gaussian_filter, xp, crop):
+    """(6, ...) tensor at window *r* from :func:`_presmoothed` products: the rest of :func:`_lattice_tensor`."""
+    b = d / 2.0
+    out = None
+    for i, a in enumerate(pre):
+        sm = gaussian_filter(a, math.sqrt(r * r - b * b) / d, mode="nearest", truncate=truncate)[crop]
+        if out is None:
+            out = xp.empty((6,) + sm.shape, dtype=xp.float32)
+        out[i] = sm
+        del sm
+    return out
+
+
+def _angles2(S1, e0, xp):
+    """theta^2 between the smallest eigenvectors of *S1* (6, ...) and *e0* (3 arrays), float32."""
+    if _fused(xp):
+        return _kernel("angle2")(*S1, *e0)
+    th2 = e0[0]  # the angle, slab by slab, over the clean direction's storage
+    for z in range(0, S1.shape[1], SLAB):
+        sl = slice(z, z + SLAB)
+        e1 = smallest_eigvec(S1[:, sl], eigvals_sym3(S1[:, sl], xp)[2].astype(xp.float32), xp)
+        dot = xp.abs(e0[0][sl] * e1[0] + e0[1][sl] * e1[1] + e0[2][sl] * e1[2])
+        th2[sl] = xp.arccos(xp.clip(dot, 0.0, 1.0)) ** 2
+        del e1, dot
+    return th2
 
 
 class KMaps:
@@ -345,32 +397,34 @@ class KMaps:
         self._k, self._up = {}, {}
 
     def _row(self, s):
-        """K at derivative scale *s* for every grid rho (coarse cells). The gradients are recomputed for
-        each rho, so only one tensor field is held at a time."""
+        """K at derivative scale *s* for every grid rho (coarse cells).
+
+        The gradients of the tile and of its noisy copy are computed once for all rhos; the rhos that
+        share a lattice step share its pre-smoothed, subsampled products (:func:`_presmoothed`).
+        """
         xp, gf, t, c = self.xp, self.gf, self.scales.truncate, self.c
         pool = lambda a: gf(a, self.sw, mode="nearest", truncate=3.0)  # noqa: E731
+        grads = [_gradients(a, s, t, gf, xp, self.support) for a in (self.img, self.noisy)]
+        steps = [_lattice_step(r, c) for r in self.scales.rho_grid]
+        pre = {}
         row = []
-        for r in self.scales.rho_grid:
-            d = 1 if r < 2.8 else (2 if r < 8 else 4)
-            d = min(d, c)
-            while c % d:
-                d //= 2
+        for i, (r, d) in enumerate(zip(self.scales.rho_grid, steps)):
             crop = tuple(slice(a // d, h // d) for a, h in zip(self.lo, self.hi))
-            g = _gradients(self.img, s, t, gf, xp, self.support)
-            S0 = _lattice_tensor(g, r, d, t, gf, xp, crop)
-            del g
+            if d > 1 and d not in pre:
+                pre = {d: [_presmoothed(g, d, t, gf, xp) for g in grads]}
+            if d > 1 and all(e == d for e in steps[i + 1 :]):
+                grads = None  # the later rhos need only these pre-smoothed products
+            if d == 1:
+                S0 = _lattice_tensor(grads[0], r, d, t, gf, xp, crop)
+            else:
+                S0 = _lattice_finish(pre[d][0], r, d, t, gf, xp, crop)
             e0, Sf = _directions(S0, xp, want_s=True)
             del S0
-            g = _gradients(self.noisy, s, t, gf, xp, self.support)
-            S1 = _lattice_tensor(g, r, d, t, gf, xp, crop)
-            del g
-            th2 = e0[0]  # the angle, slab by slab, over the clean direction's storage
-            for z in range(0, S1.shape[1], SLAB):
-                sl = slice(z, z + SLAB)
-                e1 = smallest_eigvec(S1[:, sl], eigvals_sym3(S1[:, sl], xp)[2].astype(xp.float32), xp)
-                dot = xp.abs(e0[0][sl] * e1[0] + e0[1][sl] * e1[1] + e0[2][sl] * e1[2])
-                th2[sl] = xp.arccos(xp.clip(dot, 0.0, 1.0)) ** 2
-                del e1, dot
+            if d == 1:
+                S1 = _lattice_tensor(grads[1], r, d, t, gf, xp, crop)
+            else:
+                S1 = _lattice_finish(pre[d][1], r, d, t, gf, xp, crop)
+            th2 = _angles2(S1, e0, xp)
             del S1, e0
             m = self.valid[::d, ::d, ::d][crop] & xp.isfinite(Sf) & (Sf > 0)
             Sf = xp.where(m, Sf, 0.0).astype(xp.float32)
@@ -388,6 +442,7 @@ class KMaps:
                 (pool(_bsum(th2 * m2, cc)) / xp.maximum(pool(_bsum(Sf * m2, cc)), 1e-30)).astype(xp.float32)
             )
             del th2, Sf, m, m2, K0
+        del grads, pre
         return row
 
     def park(self, on_host: bool):
