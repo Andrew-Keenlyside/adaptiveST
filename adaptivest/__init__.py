@@ -16,13 +16,17 @@ from .adaptive import (
     SIGMA0,
     AdaptiveScales,
     adaptive_structure_tensor,
+    auto_chunk,
+    blend_halo,
     rho_grid,
+    scale_maps_chunk,
     sigma_grid,
+    tensor_from_scales,
 )
 from .adaptive import scale_maps_volume as scale_maps
 from .tensor import COMPONENTS, dec, eigen, structure_tensor
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "COMPONENTS",
@@ -32,10 +36,14 @@ __all__ = [
     "SIGMA0",
     "AdaptiveScales",
     "adaptive_structure_tensor",
+    "auto_chunk",
+    "blend_halo",
     "dec",
     "eigen",
     "rho_grid",
     "scale_maps",
+    "scale_maps_chunk",
     "sigma_grid",
     "structure_tensor",
+    "tensor_from_scales",
 ]

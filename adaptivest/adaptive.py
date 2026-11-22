@@ -648,45 +648,48 @@ def _within(inner, outer):
     return tuple(slice(i.start - o.start, i.stop - o.start) for i, o in zip(inner, outer))
 
 
-def adaptive_tensor_block(
+def _at_least_f32(a, xp):
+    return a.astype(xp.float32) if a.dtype.itemsize < 4 else a
+
+
+def blend_halo(scales: AdaptiveScales) -> int:
+    """Voxels of context :func:`tensor_from_scales` reads: the largest grid sigma's gradients over the
+    largest grid rho's window (the scale search is not redone, so far less than :meth:`AdaptiveScales.halo`)."""
+    t = scales.truncate
+    return _radius(max(scales.sigma_grid), t) + _radius(max(scales.rho_grid), t)
+
+
+def tensor_from_scales(
     block,
+    sigma,
+    rho,
     scales: AdaptiveScales,
     *,
     gaussian_filter,
     tensor_dtype,
     xp=None,
-    maps=None,
     margin: int = 0,
     support=None,
 ):
-    """``S`` (6, *block.shape) at *tensor_dtype*: the tensor at each voxel's own (sigma, rho), blended.
+    """``S`` (6, *block.shape) at *tensor_dtype* from given scale maps: the blend step alone.
 
-    *maps*, a dict, receives ``rho``, ``sigma`` and ``noise`` (the noise's share
-    of the gradient power at :data:`SIGMA0`) when given. *margin* (voxels) is
-    context only: the tensor is computed for the block without it (zero there),
-    each (sigma, rho) pair only where that part uses it. *support* (0/1, the
-    block's shape) restricts every gradient and every average to the supported
-    voxels: the tensor sees only their intensities.
+    *sigma* and *rho* (voxels) cover *block* without *margin* on every side;
+    the tensor is computed there (zero in the margin), blending the
+    trace-normalised tensors at the neighbouring grid ``(sigma, rho)``
+    bilinearly in ``(log sigma, log rho)``. A NaN scale gives a zero tensor.
+    *margin* of at least :func:`blend_halo` gives the same tensor as a whole
+    volume would. *support* is as for :func:`adaptive_tensor_block`.
     """
     xp = _xp_of(block) if xp is None else xp
     t = scales.truncate
-    full = tuple(int(n) for n in block.shape)
-    block, support, m, sig, rho, share = tile_scales(
-        block, scales, gaussian_filter, xp, margin=margin, support=support
-    )
-    off = (full[0] - block.shape[0]) // 2
     shape = tuple(int(n) for n in block.shape)
-    if maps is not None:
-        for key, a in (("rho", rho), ("sigma", sig), ("noise", share)):
-            out = xp.full(full, xp.nan, dtype=xp.float32)
-            out[tuple(slice(off, off + n) for n in shape)] = a
-            maps[key] = out
-    del share
-    m = m if all(n > 2 * m for n in shape) else 0
+    m = int(margin)
     inner = tuple(slice(m, n - m) for n in shape)
-    ws = _log_weights(sig[inner], scales.sigma_grid, xp)
-    wr = _log_weights(rho[inner], scales.rho_grid, xp)
-    del rho, sig
+    if tuple(int(n) for n in sigma.shape) != tuple(s.stop - s.start for s in inner):
+        raise ValueError(f"scale maps {tuple(sigma.shape)} do not cover the block {shape} without margin {m}")
+    # Stored maps may be float16: weigh them at float32 at least.
+    ws = _log_weights(_at_least_f32(xp.asarray(sigma), xp), scales.sigma_grid, xp)
+    wr = _log_weights(_at_least_f32(xp.asarray(rho), xp), scales.rho_grid, xp)
     acc = xp.zeros((6,) + tuple(s.stop - s.start for s in inner), dtype=xp.float32)
     for i, wsi in ws.items():
         pairs = [(k, wrk) for k, wrk in wr.items() if bool((wsi * wrk).any())]
@@ -713,8 +716,62 @@ def adaptive_tensor_block(
             acc += w[None] * S
             del S, tr, w
         del grads
+    out = xp.zeros((6,) + shape, dtype=tensor_dtype)
+    out[(slice(None), *inner)] = acc
+    return out
+
+
+def adaptive_tensor_block(
+    block,
+    scales: AdaptiveScales,
+    *,
+    gaussian_filter,
+    tensor_dtype,
+    xp=None,
+    maps=None,
+    margin: int = 0,
+    support=None,
+):
+    """``S`` (6, *block.shape) at *tensor_dtype*: the tensor at each voxel's own (sigma, rho), blended.
+
+    *maps*, a dict, receives ``rho``, ``sigma`` and ``noise`` (the noise's share
+    of the gradient power at :data:`SIGMA0`) when given. *margin* (voxels) is
+    context only: the tensor is computed for the block without it (zero there),
+    each (sigma, rho) pair only where that part uses it. *support* (0/1, the
+    block's shape) restricts every gradient and every average to the supported
+    voxels: the tensor sees only their intensities.
+    """
+    xp = _xp_of(block) if xp is None else xp
+    full = tuple(int(n) for n in block.shape)
+    block, support, m, sig, rho, share = tile_scales(
+        block, scales, gaussian_filter, xp, margin=margin, support=support
+    )
+    off = (full[0] - block.shape[0]) // 2
+    shape = tuple(int(n) for n in block.shape)
+    if maps is not None:
+        for key, a in (("rho", rho), ("sigma", sig), ("noise", share)):
+            out = xp.full(full, xp.nan, dtype=xp.float32)
+            out[tuple(slice(off, off + n) for n in shape)] = a
+            maps[key] = out
+    del share
+    m = m if all(n > 2 * m for n in shape) else 0
+    inner = tuple(slice(m, n - m) for n in shape)
+    S = tensor_from_scales(
+        block,
+        sig[inner],
+        rho[inner],
+        scales,
+        gaussian_filter=gaussian_filter,
+        tensor_dtype=tensor_dtype,
+        xp=xp,
+        margin=m,
+        support=support,
+    )
+    del rho, sig
+    if shape == full:
+        return S
     out = xp.zeros((6,) + full, dtype=tensor_dtype)
-    out[(slice(None), *(slice(off + s.start, off + s.stop) for s in inner))] = acc
+    out[(slice(None), *(slice(off, off + n) for n in shape))] = S
     return out
 
 
@@ -876,6 +933,47 @@ def adaptive_structure_tensor(
     return _over_chunks(volume, scales, chunk, xp, run)
 
 
+def scale_maps_chunk(
+    volume,
+    origin,
+    size,
+    scales: AdaptiveScales | None = None,
+    *,
+    support_mask=None,
+    threshold: float | None = None,
+    gpu: bool | None = None,
+    backend=None,
+) -> dict:
+    """``{"sigma", "rho", "noise"}`` (host float32, shape *size*) for the chunk of *volume* at *origin*.
+
+    The chunk is read with :meth:`AdaptiveScales.halo` of context (edge
+    replicated outside the volume), so any chunking of a volume gives the same
+    maps up to each chunk's own noise draw. *support_mask* / *threshold* are
+    *mask* / *threshold* of :func:`adaptive_structure_tensor` (the gradients
+    and averages see only the kept voxels); the maps are not masked here.
+    *backend*, ``(xp, gaussian_filter)``, overrides *gpu*.
+    """
+    from .tensor import backend as _backend
+
+    scales = AdaptiveScales() if scales is None else scales
+    xp, gf = _backend(gpu) if backend is None else backend
+    H = scales.halo()
+    origin = tuple(int(o) for o in origin)
+    size = tuple(int(n) for n in size)
+    pad = xp.asarray(_read_padded(volume, origin, size, H))
+    _, _, m, sig, rho, share = tile_scales(
+        pad, scales, gf, xp, margin=H, support=_support(support_mask, threshold, pad, origin, size, H, xp)
+    )
+    core = tuple(slice(m, m + n) for n in size)
+    out = {}
+    for key, a in (("sigma", sig[core]), ("rho", rho[core]), ("noise", share[core])):
+        a = a.astype(xp.float32)
+        out[key] = a.get() if xp is not np else np.asarray(a)
+    del pad, sig, rho, share
+    _free(xp)
+    return out
+
+
 def scale_maps_volume(
     volume,
     scales: AdaptiveScales | None = None,
@@ -890,9 +988,7 @@ def scale_maps_volume(
 
     scales = AdaptiveScales() if scales is None else scales
     xp, gf = backend(gpu)
-    gpu = xp is not np
     shape = tuple(int(n) for n in volume.shape)
-    H = scales.halo()
 
     def run(chunk):
         out = {k: np.full(shape, np.nan, np.float32) for k in ("sigma", "rho", "noise")}
@@ -901,17 +997,11 @@ def scale_maps_volume(
             keep = _keep(mask, threshold, volume, dst)
             if keep is not None and not keep.any():
                 continue
-            pad = xp.asarray(_read_padded(volume, origin, size, H))
-            _, _, m, sig, rho, share = tile_scales(
-                pad, scales, gf, xp, margin=H, support=_support(mask, threshold, pad, origin, size, H, xp)
+            got = scale_maps_chunk(
+                volume, origin, size, scales, support_mask=mask, threshold=threshold, backend=(xp, gf)
             )
-            core = tuple(slice(m, m + n) for n in size)
-            for key, a in (("sigma", sig[core]), ("rho", rho[core]), ("noise", share[core])):
-                a = a.get() if gpu else np.asarray(a)
+            for key, a in got.items():
                 out[key][dst] = a if keep is None else np.where(keep, a, np.nan)
-            del pad, sig, rho, share
-            if gpu:
-                xp.get_default_memory_pool().free_all_blocks()
         return out
 
     return _over_chunks(volume, scales, chunk, xp, run)

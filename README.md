@@ -310,9 +310,16 @@ Lowering `rho_max` or `noise_window` cuts all three.
 | `AdaptiveScales(precision_deg=15, truncate=3, rho_max=16, noise_window=128)` | the settings |
 | `adaptive_structure_tensor(volume, scales=None, *, mask=None, threshold=None, chunk="auto", gpu=None, return_maps=False)` | per-voxel-scale tensor of the structure `mask` (or `volume > threshold`) keeps; the default settings when `scales` is None |
 | `scale_maps(volume, scales=None, *, mask=None, threshold=None, chunk="auto", gpu=None)` | `{"sigma", "rho", "noise"}` maps only |
+| `scale_maps_chunk(volume, origin, size, scales=None, *, gpu=None)` | the maps of one chunk, read with `scales.halo()` of context: for running chunks as separate tasks |
+| `tensor_from_scales(block, sigma, rho, scales, *, gaussian_filter, tensor_dtype, xp=None, margin=0)` | the blend step alone, from maps computed earlier: `block` needs only `blend_halo(scales)` of margin (82 voxels at the defaults, against `halo()` 166), and costs a few fixed-scale tensors |
 | `eigen(S)` | `values`, `direction`, `fa`, `linearity`, `planarity` |
 | `dec(direction, weight=None)` | direction-encoded colour |
 | `AdaptiveScales.as_dict()` / `from_dict()` | save and reuse the settings |
+
+Splitting the work: compute the maps once (`scale_maps`, or `scale_maps_chunk` per
+task), store them (float16 is enough), and build the tensor wherever it is needed
+with `tensor_from_scales`. The result is the one-shot tensor's up to the stored
+precision.
 
 ## Tests
 

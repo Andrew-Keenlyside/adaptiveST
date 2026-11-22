@@ -111,6 +111,46 @@ def test_adaptive_tensor_agrees_between_chunkings():
     assert np.isfinite(ma["noise"]).all() and 0 <= ma["noise"].min() and ma["noise"].max() <= 1 + 1e-6
 
 
+def test_tensor_from_stored_scales_reproduces_the_one_shot_tensor():
+    """Maps first, then the blend with only blend_halo of context: the tensor the whole chain gives."""
+    vol = _tubes(30, noise=0.2)
+    S, maps = ast.adaptive_structure_tensor(vol, SCALES, chunk=None, return_maps=True, gpu=False)
+    h = ast.blend_halo(SCALES)
+    assert h < SCALES.halo()
+    pad = ad._read_padded(vol, (0, 0, 0), vol.shape, h)
+    for dtype in (np.float32, np.float16):
+        T = ast.tensor_from_scales(
+            pad,
+            maps["sigma"].astype(dtype),
+            maps["rho"].astype(dtype),
+            SCALES,
+            gaussian_filter=gaussian_filter,
+            tensor_dtype=np.float32,
+            xp=np,
+            margin=h,
+        )[(slice(None), *(slice(h, -h),) * 3)]
+        if dtype is np.float32:
+            np.testing.assert_allclose(T, S, rtol=1e-5, atol=1e-7)
+        assert np.percentile(_angle(ast.eigen(T)["direction"], ast.eigen(S)["direction"]), 99) < 0.5
+
+
+def test_nan_scales_give_a_zero_tensor():
+    vol = _tubes(20)
+    sig = np.full((10,) * 3, np.nan, np.float32)
+    T = ast.tensor_from_scales(
+        vol[5:15, 5:15, 5:15], sig, sig, SCALES, gaussian_filter=gaussian_filter, tensor_dtype=np.float32, xp=np
+    )
+    assert not T.any()
+
+
+def test_scale_maps_chunk_matches_the_volume_driver():
+    vol = _tubes(30, noise=0.2)
+    whole = ast.scale_maps(vol, SCALES, chunk=15, gpu=False)
+    part = ast.scale_maps_chunk(vol, (15, 0, 15), (15, 15, 15), SCALES, gpu=False)
+    for k in ("sigma", "rho", "noise"):
+        np.testing.assert_array_equal(part[k], whole[k][15:, :15, 15:])
+
+
 def test_adaptive_finds_the_tube_direction():
     vol = _tubes(36, noise=0.1)
     e = ast.eigen(ast.adaptive_structure_tensor(vol, SCALES, gpu=False))
