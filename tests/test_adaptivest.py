@@ -151,6 +151,24 @@ def test_scale_maps_chunk_matches_the_volume_driver():
         np.testing.assert_array_equal(part[k], whole[k][15:, :15, 15:])
 
 
+def test_one_pass_is_a_shorter_chain_that_agrees_with_two():
+    one = ast.AdaptiveScales(**{**SCALES.as_dict(), "passes": 1})
+    assert ast.AdaptiveScales.from_dict(one.as_dict()) == one
+    assert one.halo() < SCALES.halo()
+    assert ast.AdaptiveScales().halo() == 166 and ast.AdaptiveScales(passes=1).halo() == 154
+    with pytest.raises(ValueError):
+        ast.AdaptiveScales(passes=3)
+    vol = _tubes(30, noise=0.2)
+    a = ast.eigen(ast.adaptive_structure_tensor(vol, SCALES, gpu=False))["direction"]
+    b, mb = ast.adaptive_structure_tensor(vol, one, return_maps=True, gpu=False)
+    assert np.median(_angle(a, ast.eigen(b)["direction"])) < 3.0
+    assert mb["rho"].min() >= one.rho_grid[0] - 1e-6 and mb["rho"].max() <= one.rho_max + 1e-6
+    # The chunked one-pass maps: the same chain per chunk.
+    part = ast.scale_maps_chunk(vol, (15, 0, 15), (15, 15, 15), one, gpu=False)
+    whole = ast.scale_maps(vol, one, chunk=15, gpu=False)
+    np.testing.assert_array_equal(part["rho"], whole["rho"][15:, :15, 15:])
+
+
 def test_adaptive_finds_the_tube_direction():
     vol = _tubes(36, noise=0.1)
     e = ast.eigen(ast.adaptive_structure_tensor(vol, SCALES, gpu=False))

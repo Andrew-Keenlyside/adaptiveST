@@ -101,6 +101,13 @@ class AdaptiveScales:
     rho_max: float = RHO_MAX
     #: Width (voxels) of the window the noise and ``K`` are measured in at each voxel.
     noise_window: float = NOISE_WINDOW
+    #: Passes of the rho search: 2, rho at SIGMA0, sigma over it, rho again at sigma(x); 1, the first rho
+    #: and the sigma over it (about 4 times faster; directions in tissue move by a median 0.5 degrees).
+    passes: int = 2
+
+    def __post_init__(self):
+        if self.passes not in (1, 2):
+            raise ValueError(f"passes must be 1 or 2, got {self.passes!r}")
 
     @property
     def rho_grid(self) -> tuple:
@@ -114,7 +121,7 @@ class AdaptiveScales:
         """Voxels of context a tile reads: the three passes and the blend, plus the noise window's pooling."""
         from .local_noise import pool_reach
 
-        return chain_halo(self.rho_max, self.truncate) + pool_reach(self.noise_window)
+        return chain_halo(self.rho_max, self.truncate, self.passes) + pool_reach(self.noise_window)
 
     def equivalent_scales(self) -> tuple[float, float]:
         """``(sigma, rho)`` whose fixed-scale halo (``st_halo_voxels``) equals :meth:`halo`, for the stage's planners."""
@@ -133,17 +140,21 @@ class AdaptiveScales:
             truncate=float(d.get("truncate", 3.0)),
             rho_max=float(d.get("rho_max", RHO_MAX)),
             noise_window=float(d.get("noise_window") or NOISE_WINDOW),
+            passes=int(d.get("passes", 2)),
         )
 
 
-def chain_halo(rho_max: float, truncate: float) -> int:
-    """Voxels of context the chain reads: rho (first pass), sigma over it, rho again at sigma(x), the blend."""
+def chain_halo(rho_max: float, truncate: float, passes: int = 2) -> int:
+    """Voxels of context the chain reads: rho (first pass), sigma over it, rho again at sigma(x) (when
+    *passes* is 2), the blend."""
     t = float(truncate)
     r_rho = _radius(max(rho_grid(rho_max)), t)
     r_sig = _radius(max(sigma_grid(rho_max)), t)
     smooth = _radius(V_SMOOTH, t) + _radius(RHO_SMOOTH, t)
     first = _radius(SIGMA0, t) + r_rho + smooth  # rho at SIGMA0, at a voxel
     sig = max(first, r_sig + r_rho)  # sigma at a voxel: rho there, and the windowed energies
+    if int(passes) == 1:
+        return max(sig, r_sig + r_rho)  # the blend at a voxel reads its own scales only
     second = smooth + max(sig, r_sig + r_rho)  # rho again: V at neighbours, each at its own sigma
     return max(second, r_sig + r_rho)  # the blend at a voxel
 
@@ -594,8 +605,12 @@ def tile_scales(tile, scales: AdaptiveScales, gaussian_filter, xp, *, margin: in
     t = scales.truncate
     smooth = _radius(V_SMOOTH, t) + _radius(RHO_SMOOTH, t)
     m = int(margin) - P
-    kreach = max(0, m - 2 * smooth)
-    near = tuple(slice(P + kreach, n - P - kreach) for n in tile.shape) if m > 2 * smooth else region
+    # One pass: the core reads K within one set of smoothings; two: within both passes' smoothings.
+    layers = 1 if scales.passes == 1 else 2
+    kreach = max(0, m - layers * smooth)
+    near = (
+        tuple(slice(P + kreach, n - P - kreach) for n in tile.shape) if m > layers * smooth else region
+    )
     km = KMaps(tile, noisy, support, scales, gaussian_filter, xp, region=near)
     del noisy
     _free(xp)
@@ -612,6 +627,15 @@ def tile_scales(tile, scales: AdaptiveScales, gaussian_filter, xp, *, margin: in
     # The passes of scale_maps, with K measured for the second pass's sigmas before it, so the tile and
     # its noisy copy are released while it runs. The second pass's rho is read only at the core, so only
     # the sigmas within its smoothings of the core are needed; elsewhere sigma is clamped to their range.
+    if scales.passes == 1:
+        # rho and sigma are read at the core only: rho's early stop looks within log rho's smoothing of it.
+        km.prepare([SIGMA0])
+        _free(xp)
+        rho = rho_map(
+            block, scales, gaussian_filter, xp, kmap=kmap, focus=max(0, m - _radius(RHO_SMOOTH, t)), support=sup
+        )
+        sig = sigma_map(block, rho, scales, gaussian_filter, xp, focus=max(0, m), support=sup)
+        return block, sup, m, sig, rho, share
     halo = chain_halo(scales.rho_max, t)
     f1, f2 = max(0, halo - smooth), max(0, halo - _radius(RHO_SMOOTH, t))
     km.prepare([SIGMA0], release=False)
