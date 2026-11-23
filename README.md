@@ -62,10 +62,17 @@ and a derivative scale matched to its local texture.
   squared angle by which it moves the direction, over its mean `S` (see below). ρ(x) is
   where V (smoothed over 2 voxels) first falls to `precision_deg²`, interpolated in
   log ρ.
-- **σ(x): Lindeberg's scale over the voxel's own window.** The first peak over scale
-  of the normalised gradient energy `s² |∇L_s|²`, averaged with a Gaussian of width
-  ρ(x). For a lattice of fibres the peak sits at the lattice period over 2π; where
-  the finest texture is noise, at about 0.7 voxels.
+- **σ(x): Lindeberg's scale over the voxel's own window.** Where the normalised
+  gradient energy `s² |∇L_s|²`, averaged with a Gaussian of width ρ(x), first stops
+  rising over scale: its first peak, or its first shoulder (the slope in log s falls
+  to a positive local minimum), whichever comes first; the flattest slope where there
+  is neither. For a lattice of fibres the peak sits at the lattice period over 2π;
+  where the finest texture is noise, at about 0.7 voxels. A strong edge in a small
+  window adds a response that keeps rising with scale and tilts the texture's peak
+  into a shoulder: on mouse cerebellum at 1.7 µm, a first-peak search found no peak
+  at 4% of the voxels along the grey/white boundary and sent σ to the grid's top
+  (11.3 voxels), giving patches of edge direction; the shoulder keeps σ near the
+  texture there (median 1.2) and changes nothing where there is a peak.
 - **Three passes.** ρ at σ = 0.5 (nearly no smoothing, so the first window is not
   skewed by an assumed σ); σ over that window; ρ again at each voxel's σ. Further
   passes changed ρ by under 0.2% (measured on HiP-CT with the earlier, calibrated

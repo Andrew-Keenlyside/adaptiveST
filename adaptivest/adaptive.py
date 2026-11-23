@@ -22,11 +22,14 @@ noise moves the direction, over the mean ``S``. ``V`` is smoothed over
 ``precision_deg^2``, interpolated in ``log rho`` (the grid's top where it never
 does), and ``log rho`` is smoothed over :data:`RHO_SMOOTH` voxels.
 
-**sigma(x): Lindeberg's scale over the voxel's own window.** The first interior
-peak over ``s`` of the normalised gradient energy ``s^2 |grad L_s|^2``, averaged
-with a Gaussian of width ``rho(x)`` (windows at the grid ``rho`` blended in
-``log rho``), refined by a parabola in ``log s``; the largest response where
-there is no interior peak.
+**sigma(x): Lindeberg's scale over the voxel's own window.** Where the
+normalised gradient energy ``s^2 |grad L_s|^2``, averaged with a Gaussian of
+width ``rho(x)`` (windows at the grid ``rho`` blended in ``log rho``), first
+stops rising over ``s``: its first peak, or its first shoulder (a positive local
+minimum of the slope in ``log s``), whichever comes first; the flattest slope
+where there is neither. A strong edge in a small window adds a response that
+keeps rising with ``s``: it tilts the texture's peak into a shoulder, which is
+still found, rather than sending sigma to the top of the grid.
 
 **Three passes**, so the first ``rho`` is not skewed by an assumed ``sigma``:
 ``rho`` at :data:`SIGMA0` (the smallest derivative scale, nearly no
@@ -489,19 +492,32 @@ def rho_map(
 def sigma_map(
     block, rho, scales: AdaptiveScales, gaussian_filter, xp, *, early_stop=True, focus=0, support=None
 ):
-    """sigma(x) (voxels): first interior peak of the Lindeberg response averaged over a window of rho(x).
+    """sigma(x) (voxels): where the Lindeberg response, averaged over a window of rho(x), first stops rising.
+
+    ``R(s)`` is ``s^2 |grad L_s|^2`` averaged over the window; ``D`` its slope
+    ``d log R / d log s`` between neighbouring grid scales (at their log midpoint).
+    sigma is the first of: a peak of ``R`` (``D`` crosses zero; the crossing
+    interpolated linearly), or a shoulder (``D`` has a local minimum that is still
+    positive; a parabola through the three slopes). Where there is neither, the
+    midpoint of the flattest slope. A peak is where a first-peak search finds it; a
+    shoulder is a peak that a rising background (a strong edge in a small window)
+    has tilted upwards, so sigma moves continuously from one to the other.
 
     Scales are taken in increasing order and the search stops once every voxel
-    of *block* inside *focus* voxels of its faces has an interior peak
-    (*early_stop*): only the first peak and its two neighbours are read, so
-    there the result is the same either way. Outside that inset it is not used.
+    of *block* inside *focus* voxels of its faces has a peak or a shoulder
+    (*early_stop*): each is read from the slopes up to it, so there the result
+    is the same either way. Outside that inset it is not used.
     *support* limits the gradients and the windowed energies to the supported voxels.
     """
     t = scales.truncate
     grid = scales.sigma_grid
+    if len(grid) < 2:
+        return xp.full(rho.shape, grid[0], dtype=xp.float64)
+    u = np.log(np.asarray(grid, float))
+    mid = (u[:-1] + u[1:]) / 2
     wr = _log_weights(rho, scales.rho_grid, xp)
-    R = []
-    has = None
+    D = []  # the last three slopes
+    out = done = best = best_u = prev = None
     for n, s in enumerate(grid):
         gz, gy, gx = _gradients(block, s, t, gaussian_filter, xp, support)
         E = (s * s) * (gz * gz + gy * gy + gx * gx)
@@ -511,32 +527,46 @@ def sigma_map(
         acc = xp.zeros(E.shape, dtype=xp.float32)
         for k, w in wr.items():
             acc += (w * gaussian_filter(E, scales.rho_grid[k], mode="nearest", truncate=t)).astype(xp.float32)
-        R.append(acc)
         del E
-        if n >= 2:
-            peak = (R[n - 1] > R[n - 2]) & (R[n - 1] >= R[n])
-            has = peak if has is None else has | peak
-            if early_stop and bool(_inset(has, focus).all()) and n + 1 < len(grid):
-                break
-    if len(grid) < 3:
-        best = grid[int(np.argmax([float(r.mean()) for r in R]))]
-        return xp.full(rho.shape, best, dtype=xp.float64)
-    used = np.asarray(grid[: len(R)], float)
-    R = xp.stack(R)
-    K = R.shape[0]
-    ux = xp.asarray(np.log(used))
-    is_max = xp.zeros(R.shape, dtype=bool)
-    is_max[1:-1] = (R[1:-1] > R[:-2]) & (R[1:-1] >= R[2:])
-    has = is_max.any(axis=0)
-    i = xp.where(has, xp.argmax(is_max, axis=0), xp.argmax(R, axis=0))
-    ic = xp.clip(i, 1, K - 2)
-    y0, y1, y2 = (xp.take_along_axis(R, (ic + d)[None], axis=0)[0].astype(xp.float64) for d in (-1, 0, 1))
-    u0, u1, u2 = ux[ic - 1], ux[ic], ux[ic + 1]
-    den = (u0 - u1) * (u0 - u2) * (u1 - u2)
-    A = (u2 * (y1 - y0) + u1 * (y0 - y2) + u0 * (y2 - y1)) / den
-    B = (u2**2 * (y0 - y1) + u1**2 * (y2 - y0) + u0**2 * (y1 - y2)) / den
-    uv = xp.clip(xp.where(A < 0, -B / xp.where(A < 0, 2.0 * A, 1.0), u1), u0, u2)
-    return xp.exp(xp.where(has, uv, ux[i]))
+        L = xp.log(xp.maximum(acc, xp.float32(1e-30)))
+        del acc
+        if prev is None:
+            prev = L
+            continue
+        d = ((L - prev) / (u[n] - u[n - 1])).astype(xp.float32)
+        prev = L
+        j = n - 1  # the midpoint index of d
+        if out is None:
+            out = xp.zeros(d.shape, dtype=xp.float64)
+            done = xp.zeros(d.shape, dtype=bool)
+            best, best_u = xp.abs(d), xp.full(d.shape, mid[0], dtype=xp.float64)
+        else:
+            flatter = xp.abs(d) < best
+            best = xp.where(flatter, xp.abs(d), best)
+            best_u = xp.where(flatter, mid[j], best_u)
+        D = (D + [d])[-3:]
+        if len(D) >= 2:
+            # A peak of R between midpoints j-1 and j.
+            a, b = D[-2], D[-1]
+            peak = (a > 0) & (b <= 0) & ~done
+            f = a.astype(xp.float64) / xp.where(peak, a - b, 1.0)
+            out = xp.where(peak, mid[j - 1] + f * (mid[j] - mid[j - 1]), out)
+            done |= peak
+            del f, peak
+        if len(D) == 3:
+            # A shoulder: a positive local minimum of D at midpoint j-1.
+            y0, y1, y2 = (x.astype(xp.float64) for x in D)
+            sh = (y1 > 0) & (y1 < y0) & (y1 <= y2) & ~done
+            den = y0 - 2.0 * y1 + y2
+            off = xp.clip(0.5 * (y0 - y2) / xp.where(den > 0, den, 1.0), -0.5, 0.5)
+            out = xp.where(sh, mid[j - 1] + off * (mid[j] - mid[j - 1]), out)
+            done |= sh
+            del y0, y1, y2, sh, den, off
+        if early_stop and n + 1 < len(grid) and bool(_inset(done, focus).all()):
+            break
+    del D, prev
+    out = xp.where(done, out, best_u)
+    return xp.exp(xp.clip(out, u[0], u[-1]))
 
 
 def scale_maps(

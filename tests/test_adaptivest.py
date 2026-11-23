@@ -176,6 +176,50 @@ def test_adaptive_finds_the_tube_direction():
     assert np.median(np.abs(e["direction"][core][2])) > 0.95
 
 
+def _tubes_on_a_step(step, n=48):
+    """The tube lattice (period 6: a Lindeberg scale of about 6 / 2 pi = 0.95) with a step across z at n/2."""
+    vol = _tubes(n, noise=0.05).astype(np.float64)
+    vol[n // 2 :] += step
+    return vol
+
+
+#: sigma grid 0.5 .. 5.66, so a search that runs off the top is plain to see.
+EDGE_SCALES = ast.AdaptiveScales(truncate=2.0, rho_max=8.0)
+
+
+@pytest.mark.parametrize("step", [1.0, 3.0, 10.0])
+def test_sigma_finds_the_texture_scale_beside_a_strong_edge(step):
+    # In a small window a strong step adds a response that keeps rising with sigma, so the texture's peak
+    # is tilted into a shoulder. A first-peak search found no peak there and took the grid's top
+    # (5.66 for steps 3 and 10); the shoulder is still the texture.
+    n = 48
+    vol = _tubes_on_a_step(step, n)
+    s = ad.sigma_map(vol, np.full(vol.shape, 1.5), EDGE_SCALES, gaussian_filter, np, early_stop=False)
+    far, band = s[8:16, 8:40, 8:40], s[n // 2 - 2 : n // 2 + 2, 8:40, 8:40]
+    assert np.median(far) == pytest.approx(0.95, abs=0.1)
+    assert band.max() < 2.0
+
+
+def test_sigma_moves_continuously_as_an_edge_grows():
+    # The step's share of the response grows with its height: sigma at the step rises with it, without a jump.
+    n = 48
+    band = []
+    for step in (0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0):
+        vol = _tubes_on_a_step(step, n)
+        s = ad.sigma_map(vol, np.full(vol.shape, 1.5), EDGE_SCALES, gaussian_filter, np, early_stop=False)
+        band.append(float(np.median(s[n // 2 - 2 : n // 2 + 2, 8:40, 8:40])))
+    assert np.all(np.diff(band) > -0.05)
+    assert np.max(np.diff(np.log(band))) < np.log(np.sqrt(2))  # never more than one grid step at a time
+
+
+def test_sigma_early_stop_changes_nothing_in_the_focus():
+    vol = _tubes_on_a_step(3.0)
+    rho = np.full(vol.shape, 1.5)
+    full = ad.sigma_map(vol, rho, EDGE_SCALES, gaussian_filter, np, early_stop=False)
+    early = ad.sigma_map(vol, rho, EDGE_SCALES, gaussian_filter, np, early_stop=True, focus=8)
+    np.testing.assert_array_equal(early[8:-8, 8:-8, 8:-8], full[8:-8, 8:-8, 8:-8])
+
+
 def test_more_noise_gives_larger_windows():
     quiet = ast.scale_maps(_tubes(30, noise=0.05), SCALES, gpu=False)["rho"]
     noisy = ast.scale_maps(_tubes(30, noise=2.0), SCALES, gpu=False)["rho"]
