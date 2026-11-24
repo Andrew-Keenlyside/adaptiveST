@@ -219,7 +219,7 @@ On a 384³ crop at 20 µm, with θ = 15° and `rho_max` = 16:
   noise's own scale. It rises to about 1.1–1.25 over coarse, streaky fascicular texture.
 - **ρ** ranges from about 3.5 to 9.5 voxels (10th–90th percentile). It is smaller in
   well-oriented fascicles, larger in noisy, low-contrast tissue.
-- In a tractography pipeline built on this tensor (BRIDGE, with the graph limits
+- In a tractography pipeline built on this tensor (FibreGraph, with the graph limits
   calibrated separately for each variant), the adaptive tensor gave:
 
 | | Fixed σ 1, ρ 3 | Fixed σ 1, ρ 8 | Adaptive |
@@ -314,7 +314,7 @@ Lowering `rho_max` or `noise_window` cuts all three.
 | Function | |
 |---|---|
 | `structure_tensor(volume, sigma, rho, *, truncate=3, gpu=None)` | fixed-scale tensor, (6, Z, Y, X) |
-| `AdaptiveScales(precision_deg=15, truncate=3, rho_max=16, noise_window=128, passes=2)` | the settings; `passes=1` stops after the first rho and its sigma: about 5 times faster (16.6 against 81.7 s per 128³ chunk on an RTX A2000), but on BRIDGE streamlines of 20 µm HiP-CT it kept only a fifth of the second pass's gain over fixed scales |
+| `AdaptiveScales(precision_deg=15, truncate=3, rho_max=16, noise_window=128, passes=2)` | the settings; `passes=1` stops after the first rho and its sigma: about 5 times faster (16.6 against 81.7 s per 128³ chunk on an RTX A2000), but on FibreGraph streamlines of 20 µm HiP-CT it kept only a fifth of the second pass's gain over fixed scales |
 | `adaptive_structure_tensor(volume, scales=None, *, mask=None, threshold=None, chunk="auto", gpu=None, return_maps=False)` | per-voxel-scale tensor of the structure `mask` (or `volume > threshold`) keeps; the default settings when `scales` is None |
 | `scale_maps(volume, scales=None, *, mask=None, threshold=None, chunk="auto", gpu=None)` | `{"sigma", "rho", "noise"}` maps only |
 | `scale_maps_chunk(volume, origin, size, scales=None, *, gpu=None)` | the maps of one chunk, read with `scales.halo()` of context: for running chunks as separate tasks |
