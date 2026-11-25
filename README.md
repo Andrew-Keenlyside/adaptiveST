@@ -5,9 +5,11 @@ own derivative scale σ and integration scale ρ, chosen from the image itself**
 CuPy on a CUDA GPU by default; NumPy/SciPy on the CPU where there is none.
 
 ```bash
-pip install -e .            # CPU
-pip install -e ".[gpu]"     # + CuPy (CUDA 12)
+pip install adaptiveST          # CPU
+pip install "adaptiveST[gpu]"   # + CuPy (CUDA 12)
 ```
+
+From a clone: `pip install -e .` (or `-e ".[gpu]"`).
 
 ## Quick start
 
@@ -185,7 +187,7 @@ structure, such as white matter, so the tensor sees only its own fibres' gradien
   NaN. A chunk with nothing to keep is not computed at all.
 - **The noise spectrum ignores the mask.** `K` is measured over the kept voxels.
 
-![Masking the input to isolate the fibres' own gradients](docs/mask_ab.png)
+![Masking the input to isolate the fibres' own gradients](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/mask_ab.png)
 
 *A sagittal 128³ core of I74 at 20 µm, on the edge of the internal capsule, computed
 without a mask (A) and with a white-matter mask (B; intensity smoothed at 3 voxels,
@@ -201,7 +203,7 @@ the same way.*
 This example was made with the earlier version of the method, which fitted one `K` per
 volume from sampled blocks instead of measuring it in each voxel's window.
 
-![Fixed against adaptive scales on 20 µm HiP-CT](docs/results.png)
+![Fixed against adaptive scales on 20 µm HiP-CT](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/results.png)
 
 *A 96³ block (1.9 mm) of human brain at 20 µm, computed inside a larger volume so that
 every window sees real tissue. Rows: axial, coronal and sagittal slices. Columns:
@@ -234,7 +236,7 @@ higher cost. There is no ground truth for fibre directions in this tissue.
 
 ## Example: five native-resolution datasets
 
-![Adaptive scales with the local noise on five datasets](docs/local_noise.png)
+![Adaptive scales with the local noise on five datasets](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/local_noise.png)
 
 *Rows: two 20 µm regions of the I74 hemisphere (striatum, white matter), I74 VOIs at
 10 µm and 2.2 µm, and LADAF-2021-17 at 23.4 µm. Each shows the sagittal centre slice
@@ -337,3 +339,33 @@ precision.
 pytest -q             # CPU
 pytest -q -m gpu      # CuPy against NumPy
 ```
+
+## Convergence of the rho and sigma passes
+
+![Direction change per rho and sigma update on three datasets](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/convergence.png)
+
+*The scale search alternates rho at the current sigma and sigma over the current rho:
+`(0.5, ρ₀) → (σ₀, ρ₀) → (σ₀, ρ₁) → (σ₁, ρ₁) → …`. Each update changes one map. For each,
+the tensor is blended before and after it and the angle between the two directions is
+taken at every voxel of a 128³ core (computed inside a 512³ tile; θ = 15°, `rho_max` 16,
+default settings, 6 iterations). Solid: rho updates; dashed: sigma updates. Shaded: the
+updates the default (`passes=2`) makes, ending at `(σ₀, ρ₁)`. Macaque STN at 7 µm, mouse
+STN at 1.7 µm (Allen 715699), and a deep block of human I74 at 20 µm.*
+
+| | Macaque 7 µm | Mouse 1.7 µm | Human I74 20 µm |
+|---|---|---|---|
+| sigma update 1, median | 3.9° | 3.7° | 3.3° |
+| rho update 1, median | 1.4° | 1.0° | 0.5° |
+| update 2, median | 0.01–0.03° | 0.01–0.03° | 0.002–0.01° |
+| update 3, median | 2e-4° | 4e-4° | 4e-5° |
+| rho update 6, 99th percentile | 3e-4° | 4e-3° | 0.23° |
+
+- **After the default passes, further updates move the directions very little.** From
+  update 2 on, the median change is below 0.03° and the 90th percentile below 0.25°,
+  and each further pass is about 50–100 times smaller than the one before.
+- **A small tail does not settle on I74.** About 0.4% of its voxels still move by more
+  than 1° on every rho update to the sixth, and the median rho alternates between 3.497
+  and 3.503. These voxels cycle between two states rather than converge. The cause has
+  not been investigated.
+- **Precision.** Angles use the chord form in float64. A float32 tensor resolves about
+  1e-5°, and exact zeros (maps unchanged) are drawn at 1e-6°.

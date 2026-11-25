@@ -1,14 +1,30 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "adaptiveST"
-version = "0.6.0"
+version = "0.6.1"
 description = "3D structure tensors with per-voxel adaptive derivative and integration scales"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Andrew Keenlyside" }]
+keywords = ["structure tensor", "orientation", "tractography", "microscopy", "x-ray tomography", "cupy"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
 dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.urls]
+Homepage = "https://github.com/Andrew-Keenlyside/adaptiveST"
+Source = "https://github.com/Andrew-Keenlyside/adaptiveST"
+Issues = "https://github.com/Andrew-Keenlyside/adaptiveST/issues"
 
 [project.optional-dependencies]
 gpu = ["cupy-cuda12x"]
