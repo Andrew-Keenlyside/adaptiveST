@@ -401,6 +401,59 @@ def _fused(xp) -> bool:
     return xp is not np
 
 
+_EW = {}
+
+
+def _ew(name):
+    """Small elementwise cupy kernels for the scale searches (compiled once, ``--fmad=false`` so every
+    result is the bit pattern of the unfused numpy-style expression)."""
+    if name not in _EW:
+        import cupy
+
+        spec = {
+            # v += w * vk, in place (v is the output)
+            "axpy": ("float32 w, float32 vk", "float32 v", "v = v + w * vk;"),
+            # lv = log(max(v, 1e-8)); first rho: lrho = hit ? lr0 : nan
+            "rho_first": (
+                "float32 v, float32 tgt, float64 lr0",
+                "float32 lv, float64 lrho",
+                'lv = logf(fmaxf(v, 1e-8f)); lrho = (lv <= tgt) ? lr0 : nan("");',
+            ),
+            # later rhos: lv, and lrho where a voxel first reaches the target (interpolated between rhos)
+            "rho_next": (
+                "float32 v, float32 prev, float32 tgt, float32 lo, float32 dl",
+                "float32 lv, float64 lrho",
+                "lv = logf(fmaxf(v, 1e-8f));"
+                "if ((lv <= tgt) && isnan(lrho)) {"
+                "  float f = (prev - tgt) / fmaxf(prev - lv, 1e-12f);"
+                "  f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);"
+                "  lrho = (double)(lo + f * dl); }",
+            ),
+            # E = s^2 (gz^2 + gy^2 + gx^2)
+            "energy": (
+                "float32 gz, float32 gy, float32 gx, float32 ss",
+                "float32 E",
+                "E = ss * (gz * gz + gy * gy + gx * gx);",
+            ),
+            # acc += float32(w * f), w float64, f float32 promoted
+            "acc": (
+                "float64 w, float32 f",
+                "float32 acc",
+                "acc = acc + (float)(w * (double)f);",
+            ),
+            # L = log(max(acc, 1e-30)); d = (L - prev) / du
+            "slope": (
+                "float32 acc, float32 prev, float32 du",
+                "float32 L, float32 d",
+                "L = logf(fmaxf(acc, 1e-30f)); d = (L - prev) / du;",
+            ),
+        }[name]
+        _EW[name] = cupy.ElementwiseKernel(
+            spec[0], spec[1], spec[2], f"adaptivest_{name}", options=("--fmad=false",)
+        )
+    return _EW[name]
+
+
 # ---------------------------------------------------------------------------
 # The per-tile passes
 # ---------------------------------------------------------------------------
@@ -530,6 +583,7 @@ def rho_map(
     lr = np.log(np.asarray(scales.rho_grid, float))
     lrho, prev = None, None
     pre = {}  # (source, step) -> that source's products on the lattice, shared by every window on it
+    fused = _fused(xp)
     for k in range(len(lr)):
         d = _step(scales.rho_grid[k], scales.stride)
         if d > 1:
@@ -557,17 +611,36 @@ def rho_map(
                 grads = _gradients(block, s, t, gaussian_filter, xp, support)
                 vk = _variance_at(grads, k, kmap(s, k), scales, gaussian_filter, xp, support)
                 del grads
-                v += w * vk
+                if fused:
+                    _ew("axpy")(w, vk, v)
+                else:
+                    v += w * vk
                 del vk
-        lv = xp.log(xp.maximum(v, 1e-8))
-        del v
-        hit = lv <= target
-        if lrho is None:
-            lrho = xp.where(hit, float(lr[0]), xp.nan)
+        if fused:
+            if lrho is None:
+                lv, lrho = _ew("rho_first")(v, np.float32(target), np.float64(lr[0]))
+            else:
+                lv = xp.empty_like(v)
+                _ew("rho_next")(
+                    v,
+                    prev,
+                    np.float32(target),
+                    np.float32(lr[k - 1]),
+                    np.float32(float(lr[k] - lr[k - 1])),
+                    lv,
+                    lrho,
+                )
+            del v
         else:
-            new = hit & xp.isnan(lrho)
-            f = xp.clip((prev - target) / xp.maximum(prev - lv, 1e-12), 0.0, 1.0)
-            lrho = xp.where(new, float(lr[k - 1]) + f * float(lr[k] - lr[k - 1]), lrho)
+            lv = xp.log(xp.maximum(v, 1e-8))
+            del v
+            hit = lv <= target
+            if lrho is None:
+                lrho = xp.where(hit, float(lr[0]), xp.nan)
+            else:
+                new = hit & xp.isnan(lrho)
+                f = xp.clip((prev - target) / xp.maximum(prev - lv, 1e-12), 0.0, 1.0)
+                lrho = xp.where(new, float(lr[k - 1]) + f * float(lr[k] - lr[k - 1]), lrho)
         prev = lv
         if early_stop and not bool(xp.isnan(_inset(lrho, focus)).any()):
             break
@@ -604,10 +677,14 @@ def sigma_map(
     mid = (u[:-1] + u[1:]) / 2
     wr = _log_weights(rho, scales.rho_grid, xp)
     D = []  # the last three slopes
+    fused = _fused(xp)
     out = done = best = best_u = prev = None
     for n, s in enumerate(grid):
         gz, gy, gx = _gradients(block, s, t, gaussian_filter, xp, support)
-        E = (s * s) * (gz * gz + gy * gy + gx * gx)
+        if fused:
+            E = _ew("energy")(gz, gy, gx, np.float32(s * s))
+        else:
+            E = (s * s) * (gz * gz + gy * gy + gx * gx)
         if support is not None:
             E = E * support
         del gz, gy, gx
@@ -617,7 +694,12 @@ def sigma_map(
             r = scales.rho_grid[k]
             d = _step(r, scales.stride)
             if d == 1:
-                acc += (w * gaussian_filter(E, r, mode="nearest", truncate=t)).astype(xp.float32)
+                f = gaussian_filter(E, r, mode="nearest", truncate=t)
+                if fused:
+                    _ew("acc")(w, f, acc)
+                else:
+                    acc += (w * f).astype(xp.float32)
+                del f
                 continue
             if d not in epre:
                 epre[d] = xp.ascontiguousarray(
@@ -628,12 +710,16 @@ def sigma_map(
         for d, part in lat.items():
             acc += _lattice_up(part, E.shape, d, xp)
         del E, epre, lat
-        L = xp.log(xp.maximum(acc, xp.float32(1e-30)))
+        if fused and prev is not None:
+            L, d = _ew("slope")(acc, prev, np.float32(u[n] - u[n - 1]))
+        else:
+            L = xp.log(xp.maximum(acc, xp.float32(1e-30)))
         del acc
         if prev is None:
             prev = L
             continue
-        d = ((L - prev) / (u[n] - u[n - 1])).astype(xp.float32)
+        if not fused:
+            d = ((L - prev) / (u[n] - u[n - 1])).astype(xp.float32)
         prev = L
         j = n - 1  # the midpoint index of d
         if out is None:
