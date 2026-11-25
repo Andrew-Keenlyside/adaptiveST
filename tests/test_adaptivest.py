@@ -274,3 +274,98 @@ def test_auto_chunk_fits_the_memory(monkeypatch):
         ad, "_free_bytes", lambda xp: int(tile**3 * ad.BYTES_PER_TILE_VOXEL / ad.MEMORY_FRACTION)
     )
     assert ad.auto_chunk((4000, 4000, 4000), SCALES, np) == 32
+
+
+# ---------------------------------------------------------------------------
+# The strided scale search
+# ---------------------------------------------------------------------------
+
+STRIDE_BASE = dict(truncate=2.0, rho_max=8.0, noise_window=32.0)
+
+
+def _scales(stride):
+    return ast.AdaptiveScales(**STRIDE_BASE, stride=stride)
+
+
+def test_stride_is_validated_and_keeps_the_default_settings_unchanged():
+    assert ast.AdaptiveScales().stride == 1
+    assert "stride" not in ast.AdaptiveScales().as_dict()
+    assert ast.AdaptiveScales.from_dict(ast.AdaptiveScales(stride=2).as_dict()).stride == 2
+    assert ast.AdaptiveScales.from_dict(ast.AdaptiveScales().as_dict()) == ast.AdaptiveScales()
+    assert ast.AdaptiveScales().halo() == 94 + 64 + 8
+    assert ast.AdaptiveScales(stride=2).halo() > ast.AdaptiveScales().halo()
+    with pytest.raises(ValueError):
+        ast.AdaptiveScales(stride=3)
+
+
+def test_lattice_interpolation_is_exact_for_a_linear_ramp():
+    z, y, x = np.meshgrid(np.arange(11), np.arange(10), np.arange(9), indexing="ij")
+    ramp = (z + 2.0 * y - x).astype(np.float32)
+    for d in (2, 4):
+        up = ad._lattice_up(ramp[::d, ::d, ::d], ramp.shape, d, np)
+        assert up.dtype == np.float32 and up.shape == ramp.shape
+        inside = tuple(slice(0, (n - 1) // d * d + 1) for n in ramp.shape)
+        np.testing.assert_allclose(up[inside], ramp[inside], atol=1e-4)
+
+
+def test_stride_one_is_the_unstrided_result_bit_for_bit():
+    vol = _tubes(30, seed=3)
+    a = ast.scale_maps(vol, ast.AdaptiveScales(**STRIDE_BASE), gpu=False, chunk=None)
+    b = ast.scale_maps(vol, _scales(1), gpu=False, chunk=None)
+    for k in a:
+        np.testing.assert_array_equal(a[k], b[k])
+
+
+@pytest.mark.parametrize("stride", [2, 4])
+def test_strided_maps_have_the_shape_and_dtype_and_stay_near_the_full_search(stride):
+    # Tubes of a known period (6 voxels, width 1.5) with one K for every voxel, so that only the stride differs.
+    vol = _tubes(40, noise=0.1, seed=1)
+    kmap = lambda s, k: 0.3 * (k + 1)  # noqa: E731
+    maps = {}
+    for st in (1, stride):
+        sc = _scales(st)
+        rho0 = ad.rho_map(vol, sc, gaussian_filter, np, kmap=kmap)
+        sig = ad.sigma_map(vol, rho0, sc, gaussian_filter, np)
+        rho = ad.rho_map(vol, sc, gaussian_filter, np, sigma=sig, kmap=kmap)
+        maps[st] = {"sigma": sig, "rho": rho}
+    c = (slice(12, 28),) * 3  # away from the faces
+    for k in ("sigma", "rho"):
+        got, ref = maps[stride][k], maps[1][k]
+        assert got.shape == vol.shape and np.isfinite(got).all()
+        assert got.dtype == ref.dtype
+        dl = np.abs(np.log(got[c]) - np.log(ref[c]))
+        assert np.median(dl) < 0.05, (k, np.median(dl))
+        assert np.percentile(dl, 95) < 0.25, (k, np.percentile(dl, 95))
+    # The known scale: sigma stays at the texture's scale, not the top of the grid.
+    assert np.median(maps[stride]["sigma"][c]) < 3.0
+
+
+def test_scale_maps_chunk_with_a_stride_returns_float32_maps_of_the_chunk_shape():
+    vol = _tubes(30, noise=0.1)
+    out = ast.scale_maps_chunk(vol, (0, 0, 0), (12, 12, 12), _scales(2), gpu=False)
+    assert set(out) == {"sigma", "rho", "noise"}
+    for a in out.values():
+        assert a.shape == (12, 12, 12) and a.dtype == np.float32
+
+
+def test_strided_search_finds_the_tube_direction():
+    vol = _tubes(36, noise=0.1)
+    strided = ast.AdaptiveScales(**{**SCALES.as_dict(), "stride": 2})
+    e = ast.eigen(ast.adaptive_structure_tensor(vol, strided, gpu=False))
+    core = (slice(None), *(slice(8, 28),) * 3)
+    assert np.median(np.abs(e["direction"][core][2])) > 0.95
+
+
+@pytest.mark.gpu
+def test_strided_gpu_matches_cpu():
+    pytest.importorskip("cupy")
+    vol = _tubes(40)
+    for stride in (2, 4):
+        a = ast.scale_maps(vol, _scales(stride), gpu=False, chunk=None)
+        b = ast.scale_maps(vol, _scales(stride), gpu=True, chunk=None)
+        for k in ("sigma", "rho"):
+            assert b[k].dtype == np.float32
+            dl = np.abs(np.log(a[k]) - np.log(b[k]))
+            # The lanes differ as much with stride 1 (K at the edge-replicated tile, see test_gpu_matches_cpu:
+            # median 0.002 sigma, 0.04 rho, 2 % of voxels beyond 0.3); the stride adds nothing to it.
+            assert np.median(dl) < 0.06 and (dl > 0.3).mean() < 0.03, (stride, k)

@@ -107,10 +107,17 @@ class AdaptiveScales:
     #: Passes of the rho search: 2, rho at SIGMA0, sigma over it, rho again at sigma(x); 1, the first rho
     #: and the sigma over it (about 4 times faster; directions in tissue move by a median 0.5 degrees).
     passes: int = 2
+    #: Lattice step (1, 2 or 4 voxels) the scale searches evaluate the larger windows on, as ``K`` does:
+    #: the tensor, its variance and the windowed energies at a window of 2.8 voxels or more are computed
+    #: on every *stride*-th voxel (window below 8 voxels: at most 2) and interpolated to the voxels. 1 (the
+    #: default) is the full-resolution search, unchanged.
+    stride: int = 1
 
     def __post_init__(self):
         if self.passes not in (1, 2):
             raise ValueError(f"passes must be 1 or 2, got {self.passes!r}")
+        if self.stride not in (1, 2, 4):
+            raise ValueError(f"stride must be 1, 2 or 4, got {self.stride!r}")
 
     @property
     def rho_grid(self) -> tuple:
@@ -124,7 +131,10 @@ class AdaptiveScales:
         """Voxels of context a tile reads: the three passes and the blend, plus the noise window's pooling."""
         from .local_noise import pool_reach
 
-        return chain_halo(self.rho_max, self.truncate, self.passes) + pool_reach(self.noise_window)
+        # A lattice reads a little beyond the window (its pre-smoothing, a cell of interpolation): a few
+        # voxels, in the Gaussian tails, kept to two cells rather than grown at every step of the chain.
+        lattice = 2 * self.stride if self.stride > 1 else 0
+        return chain_halo(self.rho_max, self.truncate, self.passes) + pool_reach(self.noise_window) + lattice
 
     def equivalent_scales(self) -> tuple[float, float]:
         """``(sigma, rho)`` whose fixed-scale halo (``st_halo_voxels``) equals :meth:`halo`, for the stage's planners."""
@@ -132,7 +142,10 @@ class AdaptiveScales:
         return sig, (self.halo() - _radius(sig, self.truncate)) / float(self.truncate)
 
     def as_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        if d["stride"] == 1:
+            del d["stride"]  # the default leaves the settings (and their hashes) as they were
+        return d
 
     @classmethod
     def from_dict(cls, d: dict | AdaptiveScales | None) -> AdaptiveScales | None:
@@ -144,6 +157,7 @@ class AdaptiveScales:
             rho_max=float(d.get("rho_max", RHO_MAX)),
             noise_window=float(d.get("noise_window") or NOISE_WINDOW),
             passes=int(d.get("passes", 2)),
+            stride=int(d.get("stride", 1)),
         )
 
 
@@ -392,20 +406,17 @@ def _fused(xp) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _variance_at(grads, k_index, kk, scales, gaussian_filter, xp, support=None):
-    """The smoothed predicted variance at the *k_index*-th grid rho, from gradients at one derivative scale.
+def _variance_from(S, kk, scales, gaussian_filter, xp, smooth=V_SMOOTH):
+    """The smoothed predicted variance from the tensors *S* (6, ...); *kk* is ``K`` over the same voxels (or one number).
 
-    *kk* is ``K`` at each voxel (or one number). The per-voxel eigen step runs in
-    z-slabs of :data:`SLAB` planes (it needs no neighbours), so its float64
-    temporaries stay small; the filters run on the whole block.
+    The per-voxel eigen step runs in z-slabs of :data:`SLAB` planes (it needs no neighbours), so its
+    float64 temporaries stay small; the filters run on the whole block.
     """
-    t = scales.truncate
-    S = _tensor(grads, scales.rho_grid[k_index], t, gaussian_filter, xp, xp.float32, support)
     per_voxel = getattr(kk, "ndim", 0) > 0
     if _fused(xp):
         V = _kernel("variance")(*S, kk if per_voxel else float(kk))
         del S
-        return gaussian_filter(V, V_SMOOTH, mode="nearest", truncate=t)
+        return gaussian_filter(V, smooth, mode="nearest", truncate=scales.truncate)
     V = xp.empty(S.shape[1:], dtype=xp.float32)
     for z in range(0, V.shape[0], SLAB):
         sl = slice(z, z + SLAB)
@@ -414,7 +425,65 @@ def _variance_at(grads, k_index, kk, scales, gaussian_filter, xp, support=None):
         V[sl] = xp.where(xp.isfinite(v), v, V_RANDOM)
         del l1, l2, l3, v
     del S
-    return gaussian_filter(V, V_SMOOTH, mode="nearest", truncate=t)
+    return gaussian_filter(V, smooth, mode="nearest", truncate=scales.truncate)
+
+
+def _variance_at(grads, k_index, kk, scales, gaussian_filter, xp, support=None):
+    """The smoothed predicted variance at the *k_index*-th grid rho, from gradients at one derivative scale.
+
+    *kk* is ``K`` at each voxel (or one number).
+    """
+    t = scales.truncate
+    S = _tensor(grads, scales.rho_grid[k_index], t, gaussian_filter, xp, xp.float32, support)
+    return _variance_from(S, kk, scales, gaussian_filter, xp)
+
+
+def _step(r, stride):
+    """The lattice step the window *r* is evaluated on at the setting *stride* (1, 2 or 4): the steps of ``K``."""
+    d = 1 if r < 2.8 else (2 if r < 8 else 4)
+    return max(1, min(d, int(stride)))
+
+
+def _lattice_up(a, shape, d, xp):
+    """*a*, values at every *d*-th voxel (from 0), to *shape* by separable linear interpolation (edges clamped)."""
+    a = xp.asarray(a, dtype=xp.float32)
+    for ax, n in enumerate(shape):
+        m = a.shape[ax]
+        pos = np.arange(n) / float(d)
+        i0 = np.minimum(np.floor(pos).astype(np.int64), m - 1)
+        i1 = np.minimum(i0 + 1, m - 1)
+        w = np.clip(pos - i0, 0.0, 1.0).astype(np.float32)
+        wsh = [1, 1, 1]
+        wsh[ax] = n
+        w = xp.asarray(w.reshape(wsh))
+        a = xp.take(a, xp.asarray(i0), axis=ax) * (1.0 - w) + xp.take(a, xp.asarray(i1), axis=ax) * w
+    return a.astype(xp.float32, copy=False)
+
+
+def _lattice_products(grads, d, truncate, gaussian_filter, xp, support=None):
+    """The 6 gradient products smoothed at d/2 and kept at every *d*-th voxel (shared by every window on that lattice)."""
+    out = []
+    for p, q in _PRODUCTS:
+        prod = grads[p] * grads[q]
+        if support is not None:
+            prod = prod * support
+        sm = gaussian_filter(prod, d / 2.0, mode="nearest", truncate=truncate)
+        out.append(xp.ascontiguousarray(sm[::d, ::d, ::d]))
+        del prod, sm
+    return out
+
+
+def _lattice_smooth(a, r, d, truncate, gaussian_filter):
+    """*a* (pre-smoothed at d/2, on the *d* lattice) smoothed up to the window *r*."""
+    return gaussian_filter(a, math.sqrt(r * r - (d / 2.0) ** 2) / d, mode="nearest", truncate=truncate)
+
+
+def _lattice_tensor_at(pre, r, d, truncate, gaussian_filter, xp):
+    """(6, ...) tensor at window *r* on the *d* lattice from :func:`_lattice_products`."""
+    S = xp.empty((6,) + pre[0].shape, dtype=xp.float32)
+    for i, a in enumerate(pre):
+        S[i] = _lattice_smooth(a, r, d, truncate, gaussian_filter)
+    return S
 
 
 def _inset(a, m):
@@ -460,8 +529,26 @@ def rho_map(
     target = 2.0 * math.log(math.radians(scales.precision_deg))
     lr = np.log(np.asarray(scales.rho_grid, float))
     lrho, prev = None, None
+    pre = {}  # (source, step) -> that source's products on the lattice, shared by every window on it
     for k in range(len(lr)):
-        if sources[0][0] is None:
+        d = _step(scales.rho_grid[k], scales.stride)
+        if d > 1:
+            v = None
+            for i, (w, s, grads) in enumerate(sources):
+                if (i, d) not in pre:
+                    g = grads if grads is not None else _gradients(block, s, t, gaussian_filter, xp, support)
+                    pre[(i, d)] = _lattice_products(g, d, t, gaussian_filter, xp, support)
+                    del g
+                kk = kmap(s, k)
+                kk = kk[::d, ::d, ::d] if getattr(kk, "ndim", 0) > 0 else kk
+                S = _lattice_tensor_at(pre[(i, d)], scales.rho_grid[k], d, t, gaussian_filter, xp)
+                vk = _variance_from(S, kk, scales, gaussian_filter, xp, V_SMOOTH / d)
+                del S
+                vk = vk if w is None else w[::d, ::d, ::d] * vk
+                v = vk if v is None else v + vk
+                del vk
+            v = _lattice_up(v, block.shape, d, xp)
+        elif sources[0][0] is None:
             _, s, grads = sources[0]
             v = _variance_at(grads, k, kmap(s, k), scales, gaussian_filter, xp, support)
         else:
@@ -484,7 +571,7 @@ def rho_map(
         prev = lv
         if early_stop and not bool(xp.isnan(_inset(lrho, focus)).any()):
             break
-    del sources, prev
+    del sources, prev, pre
     lrho = xp.where(xp.isnan(lrho), float(lr[-1]), lrho)
     return xp.exp(gaussian_filter(lrho, RHO_SMOOTH, mode="nearest", truncate=t))
 
@@ -525,9 +612,22 @@ def sigma_map(
             E = E * support
         del gz, gy, gx
         acc = xp.zeros(E.shape, dtype=xp.float32)
+        lat, epre = {}, {}  # windows on a lattice: summed there, interpolated once per step
         for k, w in wr.items():
-            acc += (w * gaussian_filter(E, scales.rho_grid[k], mode="nearest", truncate=t)).astype(xp.float32)
-        del E
+            r = scales.rho_grid[k]
+            d = _step(r, scales.stride)
+            if d == 1:
+                acc += (w * gaussian_filter(E, r, mode="nearest", truncate=t)).astype(xp.float32)
+                continue
+            if d not in epre:
+                epre[d] = xp.ascontiguousarray(
+                    gaussian_filter(E, d / 2.0, mode="nearest", truncate=t)[::d, ::d, ::d]
+                )
+            part = (w[::d, ::d, ::d] * _lattice_smooth(epre[d], r, d, t, gaussian_filter)).astype(xp.float32)
+            lat[d] = part if d not in lat else lat[d] + part
+        for d, part in lat.items():
+            acc += _lattice_up(part, E.shape, d, xp)
+        del E, epre, lat
         L = xp.log(xp.maximum(acc, xp.float32(1e-30)))
         del acc
         if prev is None:
