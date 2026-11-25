@@ -275,6 +275,9 @@ voxels use.
   44 µs per kept voxel; 64³ chunks cost 187 µs per kept voxel. Much more on the CPU.
   About half is the noise factors: `K` is measured at every grid σ that the core's
   σ(x) reaches (six on LADAF, σ 0.5–2.8), about 8 s each.
+  On the GPU the searches' per-voxel eigen steps run as fused kernels (since 0.6.0,
+  bit-identical, about 1.17x faster); `stride=2` adds about 1.4x (1.64x together,
+  idle RTX A6000, 128³ chunks).
 
 Lowering `rho_max` or `noise_window` cuts all three.
 
