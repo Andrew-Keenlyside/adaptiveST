@@ -111,19 +111,21 @@ def test_adaptive_tensor_agrees_between_chunkings():
     assert np.isfinite(ma["noise"]).all() and 0 <= ma["noise"].min() and ma["noise"].max() <= 1 + 1e-6
 
 
-def test_tensor_from_stored_scales_reproduces_the_one_shot_tensor():
+@pytest.mark.parametrize("rule", ["integrate", "select"])
+def test_tensor_from_stored_scales_reproduces_the_one_shot_tensor(rule):
     """Maps first, then the blend with only blend_halo of context: the tensor the whole chain gives."""
+    scales = ast.AdaptiveScales(**{**SCALES.as_dict(), "sigma_rule": rule})
     vol = _tubes(30, noise=0.2)
-    S, maps = ast.adaptive_structure_tensor(vol, SCALES, chunk=None, return_maps=True, gpu=False)
-    h = ast.blend_halo(SCALES)
-    assert h < SCALES.halo()
+    S, maps = ast.adaptive_structure_tensor(vol, scales, chunk=None, return_maps=True, gpu=False)
+    h = ast.blend_halo(scales)
+    assert h < scales.halo()
     pad = ad._read_padded(vol, (0, 0, 0), vol.shape, h)
     for dtype in (np.float32, np.float16):
         T = ast.tensor_from_scales(
             pad,
             maps["sigma"].astype(dtype),
             maps["rho"].astype(dtype),
-            SCALES,
+            scales,
             gaussian_filter=gaussian_filter,
             tensor_dtype=np.float32,
             xp=np,
@@ -169,9 +171,11 @@ def test_one_pass_is_a_shorter_chain_that_agrees_with_two():
     np.testing.assert_array_equal(part["rho"], whole["rho"][15:, :15, 15:])
 
 
-def test_adaptive_finds_the_tube_direction():
+@pytest.mark.parametrize("rule", ["integrate", "select"])
+def test_adaptive_finds_the_tube_direction(rule):
     vol = _tubes(36, noise=0.1)
-    e = ast.eigen(ast.adaptive_structure_tensor(vol, SCALES, gpu=False))
+    scales = ast.AdaptiveScales(**{**SCALES.as_dict(), "sigma_rule": rule})
+    e = ast.eigen(ast.adaptive_structure_tensor(vol, scales, gpu=False))
     core = (slice(None), *(slice(8, 28),) * 3)
     assert np.median(np.abs(e["direction"][core][2])) > 0.95
 
@@ -369,3 +373,51 @@ def test_strided_gpu_matches_cpu():
             # The lanes differ as much with stride 1 (K at the edge-replicated tile, see test_gpu_matches_cpu:
             # median 0.002 sigma, 0.04 rho, 2 % of voxels beyond 0.3); the stride adds nothing to it.
             assert np.median(dl) < 0.06 and (dl > 0.3).mean() < 0.03, (stride, k)
+
+
+# ---------------------------------------------------------------------------
+# The sigma rule: integrate (default since 0.7.0) or select (0.6.1)
+# ---------------------------------------------------------------------------
+
+
+def test_sigma_rule_defaults_and_old_settings_keep_their_rule():
+    assert ast.AdaptiveScales().sigma_rule == "integrate"
+    assert ast.AdaptiveScales().as_dict()["sigma_rule"] == "integrate"
+    sel = ast.AdaptiveScales(sigma_rule="select")
+    assert "sigma_rule" not in sel.as_dict()  # 0.6.1's settings dict, unchanged
+    assert ast.AdaptiveScales.from_dict(sel.as_dict()) == sel
+    assert ast.AdaptiveScales.from_dict(ast.AdaptiveScales().as_dict()) == ast.AdaptiveScales()
+    old = {"precision_deg": 15.0, "truncate": 3.0, "rho_max": 16.0, "noise_window": 128.0, "passes": 2}
+    assert ast.AdaptiveScales.from_dict(old).sigma_rule == "select"  # saved before 0.7.0
+    assert ast.AdaptiveScales().halo() == ast.AdaptiveScales(sigma_rule="select").halo()
+    with pytest.raises(ValueError):
+        ast.AdaptiveScales(sigma_rule="first")
+
+
+def test_integrated_tensor_is_the_scale_normalised_sum():
+    """With rho on the grid, the blend is sum_s s^2 S(s, rho) / sum_s s^2 tr S(s, rho) over every grid sigma."""
+    vol = _tubes(40, noise=0.2).astype(np.float64)
+    r = SCALES.rho_grid[2]
+    m = ast.blend_halo(SCALES)
+    inner = (slice(m, vol.shape[0] - m),) * 3
+    sig = np.ones(vol[inner].shape)
+    T = ast.tensor_from_scales(vol, sig, np.full(sig.shape, r), SCALES, gaussian_filter=gaussian_filter,
+                               tensor_dtype=np.float64, xp=np, margin=m)[(slice(None), *inner)]
+    num = sum(s * s * ast.structure_tensor(vol, s, r, truncate=SCALES.truncate, gpu=False).astype(np.float64)
+              for s in SCALES.sigma_grid)
+    want = (num / (num[0] + num[1] + num[2]))[(slice(None), *inner)]
+    np.testing.assert_allclose(T, want, rtol=2e-4, atol=1e-6)
+
+
+def test_integrated_sigma_moves_smoothly_as_an_edge_grows():
+    """No scale is chosen: sigma at a step rises steadily with its height (tenths of the tube contrast
+    apart: well under a grid step each), and away from the step it stays at the texture's scale."""
+    n = 48
+    band = []
+    for step in (0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7, 1.0):
+        vol = _tubes_on_a_step(step, n)
+        s = ad.sigma_integrated(vol, np.full(vol.shape, 1.5), EDGE_SCALES, gaussian_filter, np)
+        band.append(float(np.median(s[n // 2 - 2 : n // 2 + 2, 8:40, 8:40])))
+        assert float(np.median(s[8:16, 8:40, 8:40])) == pytest.approx(0.95, abs=0.1)
+    assert np.all(np.diff(band) > 0)
+    assert np.max(np.diff(np.log(band))) < 0.5 * np.log(np.sqrt(2))

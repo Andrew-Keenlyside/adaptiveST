@@ -9,7 +9,8 @@ pip install adaptiveST          # CPU
 pip install "adaptiveST[gpu]"   # + CuPy (CUDA 12)
 ```
 
-From a clone: `pip install -e .` (or `-e ".[gpu]"`).
+From a clone: `pip install -e .` (or `-e ".[gpu]"`). The main branch is 0.7.0 (unreleased), which
+integrates the derivative scale by default; 0.6.1 on PyPI selects it (`sigma_rule="select"` here).
 
 ## Quick start
 
@@ -26,7 +27,7 @@ e = ast.eigen(S)               # e["direction"] (3, Z, Y, X), e["fa"], e["linear
 # Adaptive scales: a sigma and rho per voxel, the noise measured in each voxel's own window
 S, maps = ast.adaptive_structure_tensor(volume, return_maps=True)   # mask=... isolates a structure
 e = ast.eigen(S)
-maps["sigma"], maps["rho"]                          # the scales each voxel used, in voxels
+maps["sigma"], maps["rho"]                          # each voxel's (mean) derivative scale and window, in voxels
 maps["noise"]                                       # the noise's share of the gradient power there
 
 rgb = ast.dec(e["direction"][:, 64])                # direction-encoded colour of slice 64
@@ -52,15 +53,17 @@ matched to its local texture:
   `S = (λ1 + λ3)/(λ1 − λ3)² + (λ2 + λ3)/(λ2 − λ3)²` (first-order perturbation of the
   smallest eigenvector). ρ(x) is where V, smoothed over 2 voxels, first falls to θ²,
   interpolated in log ρ.
-- **σ(x): Lindeberg's scale over the voxel's window.** Where `s² |∇L_s|²`, averaged over
-  a window of ρ(x), first stops rising with s: its first peak or first shoulder (a
-  positive local minimum of the slope in log s), else the flattest slope. The shoulder
-  keeps a strong edge in a small window from sending σ to the top of the grid.
+- **σ: integrated over every scale, weighted by Lindeberg's response.** For each σ on
+  the grid, `R(s)` is `s² |∇L_s|²` averaged over the voxel's window. The tensor is
+  `Σ_s s² S(s, ρ) / Σ_s s² tr S(s, ρ)`: each scale's trace-normalised tensor, weighted by
+  its share of R. `maps["sigma"]` is the R-weighted geometric mean of s, and sets the
+  second ρ. No scale is chosen, so nothing flips: selecting R's first peak (0.6.1,
+  `sigma_rule="select"`) drew sharp edges in σ where two textures meet, e.g. a fibre
+  bundle seen through a small window.
 - **Passes.** ρ at σ = 0.5; σ over that window; ρ again at each voxel's σ. Further
   passes change the directions very little (below).
-- **The tensor** blends trace-normalised tensors at the neighbouring grid (σ, ρ),
-  bilinearly in (log σ, log ρ). Grids are log-spaced at ratio √2: ρ from √2 to
-  `rho_max`, σ from 0.5 to `rho_max/√2`.
+- **Grids** are log-spaced at ratio √2: ρ from √2 to `rho_max`, σ from 0.5 to
+  `rho_max/√2`; the tensor blends between the neighbouring grid ρ in log ρ.
 
 **The local noise and K.** Nothing is calibrated, and nothing is sampled from elsewhere
 in the volume. Each voxel's noise spectrum is measured in its own window
@@ -87,6 +90,7 @@ entirely.
 | `mask` / `threshold` | none | the structure to isolate (see Masking) |
 | `chunk` | `"auto"` | tile side; `"auto"` takes the largest padded tile that fits free memory |
 | `truncate` | 3 | Gaussian kernel radius in s.d. |
+| `sigma_rule` | `"integrate"` | `"select"`: 0.6.1's first peak of R and a tensor at that σ; settings saved by 0.6.1 load as `"select"` |
 
 **Choosing θ from a tracker's tolerance.** A tracker that rejects links more than α
 apart wrongly rejects a correct link with probability about `exp(−α²/2θ²)`, so
@@ -96,34 +100,51 @@ apart wrongly rejects a correct link with probability about `exp(−α²/2θ²)`
 
 ![Adaptive scales with the local noise on five datasets](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/local_noise.png)
 
-*Rows: I74 hemisphere at 20 µm (striatum, white matter), I74 at 10 µm and 2.2 µm, and
-LADAF-2021-17 at 23.4 µm (human brain, HiP-CT). Each shows the centre slice of a 128³ core
-computed with 166 voxels of real tissue around it. Columns: the image; the noise share;
-ρ(x); σ(x); DEC (R = x, G = y, B = z) with adaptive scales; DEC at fixed scales equal to
-the adaptive means; adaptive DEC weighted by intensity. Default settings (adaptiveST 0.6.1).*
+*Rows: S-21-46 (human, HiP-CT) at 20 µm, a cortex core across the grey/white boundary and a
+deep-brain core; macaque at 7 µm and mouse at 1.7 µm, both in the subthalamic region; I74
+(human) at 0.85 µm. Each shows the centre slice of a 128³ core computed with 166 voxels of
+real tissue around it. Columns: the image; the noise share; ρ(x); σ(x) (the R-weighted
+mean); DEC (R = x, G = y, B = z) with adaptive scales; DEC at fixed scales equal to the
+adaptive means; adaptive DEC weighted by intensity. Default settings (adaptiveST 0.7.0).*
 
 | | noise share (5–95%) | ρ median (10–90%) | σ median | at `rho_max` |
 |---|---|---|---|---|
-| I74 20 µm, striatum | 0.29–0.74 | 2.8 (1.5–6.7) | 0.79 | 0% |
-| I74 20 µm, white matter | 0.83–0.97 | 5.1 (3.6–7.3) | 0.71 | 0% |
-| I74 10 µm | 0.89–0.99 | 11.7 (6.9–16.0) | 0.92 | 10% |
-| I74 2.2 µm | 0.80–0.95 | 15.5 (8.0–16.0) | 1.41 | 37% |
-| LADAF 23.4 µm | 0.39–0.94 | 6.1 (2.6–12.4) | 0.74 | 0% |
+| S-21-46 20 µm, cortex | 0.70–0.95 | 10.6 (4.6–15.6) | 2.39 | 4% |
+| S-21-46 20 µm, deep brain | 0.52–0.92 | 5.5 (3.0–9.7) | 1.26 | 0% |
+| Macaque 7 µm | 0.79–0.96 | 10.3 (4.2–15.9) | 1.21 | 8% |
+| Mouse 1.7 µm | 0.60–0.81 | 4.7 (2.8–7.8) | 1.29 | 0% |
+| I74 0.85 µm | 0.54–0.72 | 7.4 (3.8–13.6) | 1.74 | 1% |
 
-- **ρ follows the image.** It is smallest where contrast is high (striatum fascicles,
-  2.8 median) and grows with the noise share: about 5–6 at 20–23 µm, 12 at 10 µm and
-  15.5 at 2.2 µm, where 37% of the core reaches `rho_max`.
-- **σ stays near the noise's scale** (0.7–0.9) except at 2.2 µm (1.4), where the
-  finest texture is a few voxels wide.
-- **The fine VOIs read as mostly noise** (0.8–0.99 of the gradient power): they are all
-  tissue, with no noise-only sub-window, so texture is likely counted as noise there.
+- **σ and ρ are smooth maps.** ρ follows contrast (4.7 median in the mouse, about 10 in
+  the macaque and the human cortex); σ stays near 1.2–1.3, higher at 0.85 µm (1.7).
+- **Adaptive directions are more coherent than fixed ones** at the same mean scales:
+  compare the two DEC columns.
+- **σ rises at sharp tissue interfaces** (the yellow band at the grey/white boundary,
+  σ up to 5.7): a step edge has the same R at every scale, so the coarse scales share the
+  weight and the tensor there follows the boundary.
+
+### Integrated against selected σ on phantoms
+
+![Direction error on line-pair phantoms, sigma selected vs integrated](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/sigma_rule_phantoms.png)
+
+*Parallel cylinders of diameter d (period 2d) in white noise, 12 diameters × 12 noise
+levels × 3 replicates (random fibre direction, lattice rotation, phase and noise draw);
+the median over each 32³ core, geometric mean over replicates. Run with a pre-release
+build that weighted scales over the first-pass window; on the five datasets above its
+directions are within 0.2–0.8° (median) of 0.7.0's.*
+
+Over the 432 runs the integrated tensor's median direction error is 1.12× lower
+(geometric mean) and lower in 233. Thick fibres gain most, at moderate to high noise:
+1.35× lower for d ≥ 3.5, e.g. 16° → 3.7° at d 8 and noise s.d. 4. Thin fibres
+(d 1.5–3) lose 1.13×, mostly at high noise (15° → 24° at d 1.5, noise 4), and a few
+tenths of a degree at low noise.
 
 ## Convergence of the passes
 
 ![Direction change per rho and sigma update on three datasets](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/convergence.png)
 
-*Angle each update moves the directions, over a 128³ core, for six iterations of the
-chain `(0.5, ρ₀) → (σ₀, ρ₀) → (σ₀, ρ₁) → (σ₁, ρ₁) → …` (solid: ρ updates; dashed: σ
+*Measured with 0.6.1 (σ selected). Angle each update moves the directions, over a 128³ core,
+for six iterations of the chain `(0.5, ρ₀) → (σ₀, ρ₀) → (σ₀, ρ₁) → (σ₁, ρ₁) → …` (solid: ρ updates; dashed: σ
 updates; shaded: what the default computes). Macaque STN at 7 µm, mouse STN at 1.7 µm,
 human I74 at 20 µm.*
 
@@ -137,9 +158,10 @@ voxels keep moving by more than 1° per pass, alternating between two states.
   pooling reach, 72); fixed σ 1, ρ 3 needs 12.
 - **Memory:** about 100 bytes per voxel of the padded tile; `chunk="auto"` picks 128 on
   a 12 GB GPU (460³ tile, 9.0 GB peak).
-- **Speed:** about 95 s per 128³ chunk on an RTX A2000 (12 GB); much slower on the CPU.
-  About half is `K`, measured at each grid σ the core uses. Fused GPU kernels (default)
-  give 1.17x; `stride=2` about 1.4x more.
+- **Speed:** about 95 s per 128³ chunk on an RTX A2000 (12 GB) with 0.6.1; much slower on
+  the CPU. About half is `K`, measured at each grid σ the core uses. Integrating σ blends
+  the tensor at every grid σ but drops the search, and cost about the same overall (within
+  ±20% per dataset). Fused GPU kernels (default) give 1.17x; `stride=2` about 1.4x more.
 
 Lowering `rho_max` or `noise_window` cuts all three.
 
@@ -155,7 +177,11 @@ Lowering `rho_max` or `noise_window` cuts all three.
   not reproduced.
 - **Chunking changes the result statistically:** each tile draws its own noise.
 - **Bright specks and strong edges get small windows,** and bias is not modelled: the
-  rule limits noise only.
+  rule limits noise only. At a sharp tissue interface the integrated σ also leans to the
+  coarse scales, so the tensor reads the interface's orientation; mask the structure to
+  avoid it.
+- **ρ's precision target assumes one σ.** It is met at the mean σ; the integrated tensor,
+  which adds coarser and less noisy scales, is usually more precise than that.
 - **FA and linearity change meaning with the scales,** which differ from voxel to voxel.
 
 ## API
@@ -163,7 +189,7 @@ Lowering `rho_max` or `noise_window` cuts all three.
 | Function | |
 |---|---|
 | `structure_tensor(volume, sigma, rho, *, truncate=3, gpu=None)` | fixed-scale tensor, (6, Z, Y, X) |
-| `AdaptiveScales(precision_deg=15, truncate=3, rho_max=16, noise_window=128, passes=2, stride=1)` | the settings; `passes=1` stops after the first ρ and its σ (about 5x faster, less accurate); `stride=2` or `4` evaluates the larger windows on a lattice and interpolates (about 1.4x faster, maps within 0.01 in log ρ) |
+| `AdaptiveScales(precision_deg=15, truncate=3, rho_max=16, noise_window=128, passes=2, stride=1, sigma_rule="integrate")` | the settings; `passes=1` stops after the first ρ and its σ (about 5x faster, less accurate); `stride=2` or `4` evaluates the larger windows on a lattice and interpolates (about 1.4x faster, maps within 0.01 in log ρ) |
 | `adaptive_structure_tensor(volume, scales=None, *, mask=None, threshold=None, chunk="auto", gpu=None, return_maps=False)` | per-voxel-scale tensor |
 | `scale_maps(volume, scales=None, *, mask=None, threshold=None, chunk="auto", gpu=None)` | `{"sigma", "rho", "noise"}` maps only |
 | `scale_maps_chunk(volume, origin, size, scales=None, *, gpu=None)` | one chunk's maps, read with `scales.halo()` of context |

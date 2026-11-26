@@ -26,7 +26,7 @@ from .adaptive import (
 from .adaptive import scale_maps_volume as scale_maps
 from .tensor import COMPONENTS, dec, eigen, structure_tensor
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 __all__ = [
     "COMPONENTS",

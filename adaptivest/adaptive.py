@@ -22,22 +22,28 @@ noise moves the direction, over the mean ``S``. ``V`` is smoothed over
 ``precision_deg^2``, interpolated in ``log rho`` (the grid's top where it never
 does), and ``log rho`` is smoothed over :data:`RHO_SMOOTH` voxels.
 
-**sigma(x): Lindeberg's scale over the voxel's own window.** Where the
-normalised gradient energy ``s^2 |grad L_s|^2``, averaged with a Gaussian of
-width ``rho(x)`` (windows at the grid ``rho`` blended in ``log rho``), first
-stops rising over ``s``: its first peak, or its first shoulder (a positive local
-minimum of the slope in ``log s``), whichever comes first; the flattest slope
-where there is neither. A strong edge in a small window adds a response that
-keeps rising with ``s``: it tilts the texture's peak into a shoulder, which is
-still found, rather than sending sigma to the top of the grid.
+**The derivative scale: integrated (default) or selected.** Both read the
+Lindeberg response ``R(s) = s^2 |grad L_s|^2``, averaged with a Gaussian of
+width ``rho(x)`` (windows at the grid ``rho`` blended in ``log rho``), at every
+grid ``s``.
+
+- ``sigma_rule="integrate"`` (default since 0.7.0): no scale is chosen. The
+  tensor is ``sum_s s^2 S(s, rho) / sum_s s^2 tr S(s, rho)`` over every grid
+  sigma: each scale's trace-normalised tensor, weighted by its share of ``R``.
+  ``sigma(x)`` is the R-weighted geometric mean of ``s``. A choice between two
+  peaks of ``R`` flips where they trade places, which drew sharp edges in the
+  sigma map inside textured tissue; a weighted sum moves continuously.
+- ``sigma_rule="select"`` (0.6.1): ``sigma(x)`` is where ``R`` first stops
+  rising over ``s``: its first peak, or its first shoulder (a positive local
+  minimum of the slope in ``log s``); the flattest slope where there is
+  neither. The tensor blends the trace-normalised tensors at the neighbouring
+  grid ``(sigma, rho)`` bilinearly in ``(log sigma, log rho)``.
 
 **Three passes**, so the first ``rho`` is not skewed by an assumed ``sigma``:
 ``rho`` at :data:`SIGMA0` (the smallest derivative scale, nearly no
 smoothing); ``sigma`` over that ``rho``; ``rho`` again at ``sigma(x)`` (``V``
-blended between the grid sigmas). The tensor then blends the trace-normalised
-tensors at the neighbouring grid ``(sigma, rho)`` bilinearly in
-``(log sigma, log rho)``, and :func:`adaptivest.eigen` reads FA and the
-direction from it as from a fixed one.
+blended between the grid sigmas). :func:`adaptivest.eigen` reads FA and the
+direction from the tensor as from a fixed one.
 
 **Chunking** changes the result only statistically: the scale search and the
 blend are local filters inside the halo, but the noise and ``K`` are window
@@ -61,6 +67,8 @@ RHO_MAX = 16.0
 #: Smoothing of the predicted variance and of log rho (voxels).
 V_SMOOTH = 2.0
 RHO_SMOOTH = 2.0
+#: How the derivative scale enters the tensor (:attr:`AdaptiveScales.sigma_rule`).
+SIGMA_RULES = ("integrate", "select")
 #: E[theta^2] of a random axis against a fixed one: no prediction is worse.
 V_RANDOM = math.pi - 2.0
 #: Default target angular precision (degrees).
@@ -112,12 +120,21 @@ class AdaptiveScales:
     #: on every *stride*-th voxel (window below 8 voxels: at most 2) and interpolated to the voxels. 1 (the
     #: default) is the full-resolution search, unchanged.
     stride: int = 1
+    #: How the derivative scale enters the tensor. "integrate" (the default since 0.7.0): the tensor is
+    #: the sum over every grid sigma of the scale-normalised tensors ``s^2 S(s, rho)``, normalised by
+    #: their total trace, so each scale counts in proportion to its share of the normalised gradient
+    #: energy R(s) in the voxel's window; ``sigma(x)`` is the R-weighted geometric mean of s and sets
+    #: the second rho. "select" (0.6.1): sigma(x) is R's first peak or shoulder and the tensor is blended
+    #: at the neighbouring grid sigma only.
+    sigma_rule: str = "integrate"
 
     def __post_init__(self):
         if self.passes not in (1, 2):
             raise ValueError(f"passes must be 1 or 2, got {self.passes!r}")
         if self.stride not in (1, 2, 4):
             raise ValueError(f"stride must be 1, 2 or 4, got {self.stride!r}")
+        if self.sigma_rule not in SIGMA_RULES:
+            raise ValueError(f"sigma_rule must be one of {SIGMA_RULES}, got {self.sigma_rule!r}")
 
     @property
     def rho_grid(self) -> tuple:
@@ -145,6 +162,8 @@ class AdaptiveScales:
         d = asdict(self)
         if d["stride"] == 1:
             del d["stride"]  # the default leaves the settings (and their hashes) as they were
+        if d["sigma_rule"] == "select":
+            del d["sigma_rule"]  # 0.6.1's rule: its settings (and their hashes) as they were
         return d
 
     @classmethod
@@ -158,6 +177,8 @@ class AdaptiveScales:
             noise_window=float(d.get("noise_window") or NOISE_WINDOW),
             passes=int(d.get("passes", 2)),
             stride=int(d.get("stride", 1)),
+            # Settings saved before 0.7.0 carry no rule: they ran (and reproduce with) "select".
+            sigma_rule=str(d.get("sigma_rule", "select")),
         )
 
 
@@ -649,6 +670,72 @@ def rho_map(
     return xp.exp(gaussian_filter(lrho, RHO_SMOOTH, mode="nearest", truncate=t))
 
 
+def _windowed_energy(E, wr, scales: AdaptiveScales, gaussian_filter, xp, fused):
+    """``E`` averaged over each voxel's window: Gaussians of the rho grid, mixed by the weights *wr*
+    (from :func:`_log_weights`); windows of a lattice step above 1 summed on the lattice, interpolated once."""
+    t = scales.truncate
+    acc = xp.zeros(E.shape, dtype=xp.float32)
+    lat, epre = {}, {}
+    for k, w in wr.items():
+        r = scales.rho_grid[k]
+        d = _step(r, scales.stride)
+        if d == 1:
+            f = gaussian_filter(E, r, mode="nearest", truncate=t)
+            if fused:
+                _ew("acc")(w, f, acc)
+            else:
+                acc += (w * f).astype(xp.float32)
+            del f
+            continue
+        if d not in epre:
+            epre[d] = xp.ascontiguousarray(gaussian_filter(E, d / 2.0, mode="nearest", truncate=t)[::d, ::d, ::d])
+        part = (w[::d, ::d, ::d] * _lattice_smooth(epre[d], r, d, t, gaussian_filter)).astype(xp.float32)
+        lat[d] = part if d not in lat else lat[d] + part
+    for d, part in lat.items():
+        acc += _lattice_up(part, E.shape, d, xp)
+    return acc
+
+
+def sigma_integrated(block, rho, scales: AdaptiveScales, gaussian_filter, xp, *, early_stop=True, focus=0, support=None):
+    """sigma(x) (voxels) for ``sigma_rule="integrate"``: the geometric mean of the grid scales s, each
+    weighted by the Lindeberg response ``R(s)``, ``s^2 |grad L_s|^2`` averaged over a window of rho(x).
+
+    The tensor itself is integrated over every grid sigma (:func:`tensor_from_scales`); this mean is the
+    scale the second rho is measured at and the ``sigma`` map. Every scale is read, so *early_stop* and
+    *focus* (kept for the call signature of :func:`sigma_map`) change nothing.
+    """
+    t = scales.truncate
+    grid = scales.sigma_grid
+    wr = _log_weights(rho, scales.rho_grid, xp)
+    fused = _fused(xp)
+    num = den = None
+    for s in grid:
+        gz, gy, gx = _gradients(block, s, t, gaussian_filter, xp, support)
+        if fused:
+            E = _ew("energy")(gz, gy, gx, np.float32(s * s))
+        else:
+            E = (s * s) * (gz * gz + gy * gy + gx * gx)
+        if support is not None:
+            E = E * support
+        del gz, gy, gx
+        acc = _windowed_energy(E, wr, scales, gaussian_filter, xp, fused).astype(xp.float64)
+        del E
+        if num is None:
+            num, den = acc * math.log(s), acc
+        else:
+            num += acc * math.log(s)
+            den += acc
+        del acc
+    lu = xp.where(den > 0, num / xp.where(den > 0, den, 1.0), math.log(SIGMA0))
+    return xp.exp(xp.clip(lu, math.log(min(grid)), math.log(max(grid))))
+
+
+def _sigma_step(block, rho, scales: AdaptiveScales, gaussian_filter, xp, **kw):
+    """The sigma step of the chain under the settings' rule."""
+    fn = sigma_integrated if scales.sigma_rule == "integrate" else sigma_map
+    return fn(block, rho, scales, gaussian_filter, xp, **kw)
+
+
 def sigma_map(
     block, rho, scales: AdaptiveScales, gaussian_filter, xp, *, early_stop=True, focus=0, support=None
 ):
@@ -688,28 +775,8 @@ def sigma_map(
         if support is not None:
             E = E * support
         del gz, gy, gx
-        acc = xp.zeros(E.shape, dtype=xp.float32)
-        lat, epre = {}, {}  # windows on a lattice: summed there, interpolated once per step
-        for k, w in wr.items():
-            r = scales.rho_grid[k]
-            d = _step(r, scales.stride)
-            if d == 1:
-                f = gaussian_filter(E, r, mode="nearest", truncate=t)
-                if fused:
-                    _ew("acc")(w, f, acc)
-                else:
-                    acc += (w * f).astype(xp.float32)
-                del f
-                continue
-            if d not in epre:
-                epre[d] = xp.ascontiguousarray(
-                    gaussian_filter(E, d / 2.0, mode="nearest", truncate=t)[::d, ::d, ::d]
-                )
-            part = (w[::d, ::d, ::d] * _lattice_smooth(epre[d], r, d, t, gaussian_filter)).astype(xp.float32)
-            lat[d] = part if d not in lat else lat[d] + part
-        for d, part in lat.items():
-            acc += _lattice_up(part, E.shape, d, xp)
-        del E, epre, lat
+        acc = _windowed_energy(E, wr, scales, gaussian_filter, xp, fused)
+        del E
         if fused and prev is not None:
             L, d = _ew("slope")(acc, prev, np.float32(u[n] - u[n - 1]))
         else:
@@ -781,7 +848,7 @@ def scale_maps(
     f2 = max(0, halo - _radius(RHO_SMOOTH, t)) if trace is None else 0
     kw = dict(support=support, kmap=kmap)
     rho = rho_map(block, scales, gaussian_filter, xp, focus=f1, **kw)
-    sig = sigma_map(block, rho, scales, gaussian_filter, xp, focus=f1, support=support)
+    sig = _sigma_step(block, rho, scales, gaussian_filter, xp, focus=f1, support=support)
     if trace is not None:
         trace.append((sig, rho))
     for it in range(int(iterations)):
@@ -789,7 +856,7 @@ def scale_maps(
             block, scales, gaussian_filter, xp, sigma=sig, focus=f2 if it + 1 == iterations else f1, **kw
         )
         if trace is not None or it + 1 < iterations:
-            sig_next = sigma_map(block, rho, scales, gaussian_filter, xp, focus=f1, support=support)
+            sig_next = _sigma_step(block, rho, scales, gaussian_filter, xp, focus=f1, support=support)
             if trace is not None:
                 trace.append((sig_next, rho))
             if it + 1 < iterations:
@@ -850,7 +917,7 @@ def tile_scales(tile, scales: AdaptiveScales, gaussian_filter, xp, *, margin: in
         rho = rho_map(
             block, scales, gaussian_filter, xp, kmap=kmap, focus=max(0, m - _radius(RHO_SMOOTH, t)), support=sup
         )
-        sig = sigma_map(block, rho, scales, gaussian_filter, xp, focus=max(0, m), support=sup)
+        sig = _sigma_step(block, rho, scales, gaussian_filter, xp, focus=max(0, m), support=sup)
         return block, sup, m, sig, rho, share
     halo = chain_halo(scales.rho_max, t)
     f1, f2 = max(0, halo - smooth), max(0, halo - _radius(RHO_SMOOTH, t))
@@ -858,7 +925,7 @@ def tile_scales(tile, scales: AdaptiveScales, gaussian_filter, xp, *, margin: in
     km.park(True)
     _free(xp)
     rho = rho_map(block, scales, gaussian_filter, xp, kmap=kmap, focus=f1, support=sup)
-    sig = sigma_map(block, rho, scales, gaussian_filter, xp, focus=f1, support=sup)
+    sig = _sigma_step(block, rho, scales, gaussian_filter, xp, focus=f1, support=sup)
     grid = scales.sigma_grid
     used = _inset(sig, max(0, m - smooth)) if m > smooth else sig
     lo_s, hi_s = (
@@ -899,6 +966,47 @@ def blend_halo(scales: AdaptiveScales) -> int:
     return _radius(max(scales.sigma_grid), t) + _radius(max(scales.rho_grid), t)
 
 
+def _integrated_blend(block, sigma, rho, scales, gaussian_filter, tensor_dtype, xp, inner, shape, support):
+    """``sigma_rule="integrate"``: ``sum_s s^2 S(s, rho(x)) / sum_s s^2 tr S(s, rho(x))`` over every grid
+    sigma, each ``S`` blended between the neighbouring grid rho. A scale's share of the result is its share
+    of the windowed Lindeberg response ``R(s) = s^2 tr S(s, rho)``, and its direction enters trace-
+    normalised. *sigma* is not used except that a NaN there, as in rho, gives a zero tensor."""
+    t = scales.truncate
+    rho = _at_least_f32(xp.asarray(rho), xp)
+    ok = xp.isfinite(rho) & xp.isfinite(_at_least_f32(xp.asarray(sigma), xp))
+    wr = _log_weights(xp.where(ok, rho, xp.nan), scales.rho_grid, xp)
+    pairs = [(k, w) for k, w in wr.items() if bool(w.any())]
+    core = tuple(s.stop - s.start for s in inner)
+    acc = xp.zeros((6,) + core, dtype=xp.float32)
+    tot = xp.zeros(core, dtype=xp.float32)
+    if pairs:
+        reach = max(_radius(scales.rho_grid[k], t) for k, _ in pairs)
+        for s in scales.sigma_grid:
+            crop = _grow(_grow(inner, reach, shape), _radius(s, t), shape)
+            sup = None if support is None else support[crop]
+            grads = _gradients(block[crop], s, t, gaussian_filter, xp, sup)
+            for k, wrk in pairs:
+                need = _grow(inner, _radius(scales.rho_grid[k], t), shape)
+                S = _tensor(
+                    tuple(gr[_within(need, crop)] for gr in grads),
+                    scales.rho_grid[k],
+                    t,
+                    gaussian_filter,
+                    xp,
+                    xp.float32,
+                    None if support is None else support[need],
+                )[(slice(None), *_within(inner, need))]
+                w = ((s * s) * wrk).astype(xp.float32)
+                acc += w[None] * S
+                tot += w * (S[0] + S[1] + S[2])
+                del S, w
+            del grads
+    acc *= (xp.where(tot > 0, 1.0 / xp.where(tot > 0, tot, 1.0), 0.0)).astype(xp.float32)[None]
+    out = xp.zeros((6,) + shape, dtype=tensor_dtype)
+    out[(slice(None), *inner)] = acc
+    return out
+
+
 def tensor_from_scales(
     block,
     sigma,
@@ -914,7 +1022,9 @@ def tensor_from_scales(
     """``S`` (6, *block.shape) at *tensor_dtype* from given scale maps: the blend step alone.
 
     *sigma* and *rho* (voxels) cover *block* without *margin* on every side;
-    the tensor is computed there (zero in the margin), blending the
+    the tensor is computed there (zero in the margin). Under
+    ``sigma_rule="integrate"`` it is summed over every grid sigma at the
+    voxel's rho (*sigma* is not needed); under ``"select"`` it blends the
     trace-normalised tensors at the neighbouring grid ``(sigma, rho)``
     bilinearly in ``(log sigma, log rho)``. A NaN scale gives a zero tensor.
     *margin* of at least :func:`blend_halo` gives the same tensor as a whole
@@ -928,6 +1038,8 @@ def tensor_from_scales(
     if tuple(int(n) for n in sigma.shape) != tuple(s.stop - s.start for s in inner):
         raise ValueError(f"scale maps {tuple(sigma.shape)} do not cover the block {shape} without margin {m}")
     # Stored maps may be float16: weigh them at float32 at least.
+    if scales.sigma_rule == "integrate":
+        return _integrated_blend(block, sigma, rho, scales, gaussian_filter, tensor_dtype, xp, inner, shape, support)
     ws = _log_weights(_at_least_f32(xp.asarray(sigma), xp), scales.sigma_grid, xp)
     wr = _log_weights(_at_least_f32(xp.asarray(rho), xp), scales.rho_grid, xp)
     acc = xp.zeros((6,) + tuple(s.stop - s.start for s in inner), dtype=xp.float32)
