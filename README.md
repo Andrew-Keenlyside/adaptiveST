@@ -9,8 +9,8 @@ pip install adaptiveST          # CPU
 pip install "adaptiveST[gpu]"   # + CuPy (CUDA 12)
 ```
 
-From a clone: `pip install -e .` (or `-e ".[gpu]"`). The main branch is 0.7.0 (unreleased), which
-integrates the derivative scale by default; 0.6.1 on PyPI selects it (`sigma_rule="select"` here).
+From a clone: `pip install -e .` (or `-e ".[gpu]"`). Since 0.7.0 the derivative scale is integrated by
+default; 0.6.1 selected it, and `sigma_rule="select"` reproduces that.
 
 ## Quick start
 
