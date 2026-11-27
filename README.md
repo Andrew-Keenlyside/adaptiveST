@@ -1,5 +1,8 @@
 # adaptiveST
 
+> This work is derived from a collaboration with Isabella Hezhao
+> ([Structure_Tensor_HiP-CT](https://github.com/1ssot0pe/Structure_Tensor_HiP-CT)).
+
 3D structure tensors for volumetric images, at fixed scales or with **each voxel's
 own derivative scale σ and integration scale ρ, chosen from the image itself**.
 CuPy on a CUDA GPU by default; NumPy/SciPy on the CPU where there is none.
