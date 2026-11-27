@@ -98,14 +98,17 @@ apart wrongly rejects a correct link with probability about `exp(−α²/2θ²)`
 
 ## Example: five native-resolution datasets
 
-![Adaptive scales with the local noise on five datasets](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/local_noise.png)
+![Adaptive scales on five datasets, and convergence of the scale passes](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/local_noise.png)
 
-*Rows: S-21-46 (human, HiP-CT) at 20 µm, a cortex core across the grey/white boundary and a
-deep-brain core; macaque at 7 µm and mouse at 1.7 µm, both in the subthalamic region; I74
-(human) at 0.85 µm. Each shows the centre slice of a 128³ core computed with 166 voxels of
-real tissue around it. Columns: the image; the noise share; ρ(x); σ(x) (the R-weighted
-mean); DEC (R = x, G = y, B = z) with adaptive scales; DEC at fixed scales equal to the
-adaptive means; adaptive DEC weighted by intensity. Default settings (adaptiveST 0.7.0).*
+*a–g: default settings (adaptiveST 0.7.0) on 128³ cores, each computed with 166 voxels of
+real tissue around it; the centre (z, y) plane of each core. Rows: S-21-46 (human, HiP-CT)
+at 20 µm, a cortex core across the grey/white boundary and a deep-brain core; macaque at
+7 µm and mouse at 1.7 µm, both in the subthalamic region; I74 (human) at 0.85 µm.
+**a** image; **b** share of the σ 0.5 gradient power the local noise model calls noise;
+**c** ρ(x); **d** σ(x), the R-weighted geometric mean of the grid scales; **e** direction,
+DEC (R = |x|, G = |y|, B = |z|) with adaptive scales; **f** DEC at one fixed σ and ρ per
+core, the adaptive means (inset); **g** **e** weighted by intensity. h–j: how far each
+further scale pass moves the directions (see [Convergence of the passes](#convergence-of-the-passes)).*
 
 | | noise share (5–95%) | ρ median (10–90%) | σ median | at `rho_max` |
 |---|---|---|---|---|
@@ -123,30 +126,42 @@ adaptive means; adaptive DEC weighted by intensity. Default settings (adaptiveST
   σ up to 5.7): a step edge has the same R at every scale, so the coarse scales share the
   weight and the tensor there follows the boundary.
 
-### Integrated against selected σ on phantoms
+### Line-pair phantoms
 
-![Direction error on line-pair phantoms, sigma selected vs integrated](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/sigma_rule_phantoms.png)
+![adaptiveST 0.7.0 on line-pair phantoms](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/phantoms.png)
 
-*Parallel cylinders of diameter d (period 2d) in white noise, 12 diameters × 12 noise
-levels × 3 replicates (random fibre direction, lattice rotation, phase and noise draw);
-the median over each 32³ core, geometric mean over replicates. Run with a pre-release
-build that weighted scales over the first-pass window; on the five datasets above its
-directions are within 0.2–0.8° (median) of 0.7.0's.*
+*Parallel cylinders of diameter d separated by gaps of d (period 2d), contrast 1, in white
+noise: 12 diameters × 12 noise levels × 6 replicates, each with its own fibre direction,
+lattice rotation, phase and noise draw; the median over each 32³ core, geometric mean over
+replicates and 95% CI. a–d against diameter, e–h against noise. **a,e** σ; **b,f** ρ;
+**c,g** direction error; **d,h** estimated / true noise share. Dashed: in a,e the σ
+predicted from the noise-free phantom's response plus noise² × the filters' response to
+white noise (calculated); in c,g the same replicates without noise. Open markers: ρ ≥ 6,
+where a 32³ core holds few independent windows. Grey band: period ≤ 2.5 voxels.*
 
-Over the 432 runs the integrated tensor's median direction error is 1.12× lower
-(geometric mean) and lower in 233. Thick fibres gain most, at moderate to high noise:
-1.35× lower for d ≥ 3.5, e.g. 16° → 3.7° at d 8 and noise s.d. 4. Thin fibres
-(d 1.5–3) lose 1.13×, mostly at high noise (15° → 24° at d 1.5, noise 4), and a few
-tenths of a degree at low noise.
+- **σ is what the integration predicts**, within 0.5% at every point (dashed under the
+  solid lines in a and e). It is not period/2π: the R-weighted mean of a single sinusoid
+  on this grid is 0.8–1.7 × period/2π, and noise pulls weight to the finest scales.
+- **At low noise the error is the phantom's own floor**: the same replicates without
+  noise give the same error, replicate by replicate (0.04–0.12° for d ≥ 4, 0.5–1° at
+  d 2). Near the sampling limit (d ≤ 1.25) nothing reads the lattice.
+- **Scatter at high noise is the test, not the method**: once ρ ≥ 6 a 32³ core holds about
+  one independent window, so each replicate is one draw.
+
+Against 0.6.1 on the same 864 phantoms (same seeds), the integrated tensor's median
+direction error is 1.11× lower (geometric mean) and lower in 460. Thick fibres gain most:
+1.36× lower for d ≥ 3.5 (lower in 279 of 360), 2.2× at noise s.d. ≥ 1 (e.g. 17° → 4.0° at
+d 8, noise 4). Thin fibres (d 1.5–3) lose 1.14×, at low and high noise alike (14° → 21° at d 1.5,
+noise 4; 0.13° → 0.22° at d 3, noise 0.02).
 
 ## Convergence of the passes
 
-![Direction change per rho and sigma update on three datasets](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/convergence.png)
-
-*Measured with 0.6.1 (σ selected). Angle each update moves the directions, over a 128³ core,
-for six iterations of the chain `(0.5, ρ₀) → (σ₀, ρ₀) → (σ₀, ρ₁) → (σ₁, ρ₁) → …` (solid: ρ updates; dashed: σ
-updates; shaded: what the default computes). Macaque STN at 7 µm, mouse STN at 1.7 µm,
-human I74 at 20 µm.*
+*Panels h–j of the [example figure](#example-five-native-resolution-datasets), measured with
+0.6.0 (σ selected). Angle each update moves the directions over a 128³ core with 192 voxels
+around it, for six iterations of the chain `(0.5, ρ₀) → (σ₀, ρ₀) → (σ₀, ρ₁) → (σ₁, ρ₁) → …`:
+h median, i 90th and j 99th percentile (solid: ρ updates; dashed: σ updates; shaded: what
+the default computes). Macaque STN at 7 µm and mouse STN at 1.7 µm (the cores of rows 3
+and 4) and human I74 deep brain at 20 µm. Not yet measured with the integrated σ.*
 
 The first σ and ρ updates move directions by a median 3–4° and 0.5–1.4°; every later
 update moves them by under 0.03°, about 50–100 times less per pass. On I74, 0.4% of
