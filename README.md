@@ -136,16 +136,19 @@ further scale pass moves the directions (see [Convergence of the passes](#conver
 ![adaptiveST 0.7.0 on line-pair phantoms](https://raw.githubusercontent.com/Andrew-Keenlyside/adaptiveST/main/docs/phantoms.png)
 
 *Parallel cylinders of diameter d separated by gaps of d (period 2d), contrast 1, in white
-noise: 12 diameters × 12 noise levels × 6 replicates, each with its own fibre direction,
-lattice rotation, phase and noise draw; the median over each 32³ core, geometric mean over
-replicates and 95% CI. a–d against diameter, e–h against noise. **a,e** σ; **b,f** ρ;
-**c,g** direction error; **d,h** estimated / true noise share. Dashed: in a,e the σ
-predicted from the noise-free phantom's response plus noise² × the filters' response to
-white noise (calculated); in c,g the same replicates without noise. Open markers: ρ ≥ 6,
-where a 32³ core holds few independent windows. Grey band: period ≤ 2.5 voxels.*
+noise. **a–d** the phantoms (shown along the image axes; in the runs the fibre direction and
+lattice rotation are random): across and along the fibres at d 4, across at d 6, and d 6
+with noise s.d. 0.94. **e–l** 12 diameters × 12 noise levels × 6 replicates, each with
+its own fibre direction, lattice rotation, phase and noise draw; the median over each 32³
+core, geometric mean over replicates and 95% CI. e–h against diameter, i–l against noise.
+**e,i** σ; **f,j** ρ; **g,k** direction error; **h,l** estimated / true noise share.
+Dashed: in e,i the σ predicted from the noise-free phantom's response plus noise² × the
+filters' response to white noise (calculated); in g,k the same replicates without noise.
+Open markers: ρ ≥ 6, where a 32³ core holds few independent windows. Grey band: period
+≤ 2.5 voxels.*
 
 - **σ is what the integration predicts**, within 0.5% at every point (dashed under the
-  solid lines in a and e). It is not period/2π: the R-weighted mean of a single sinusoid
+  solid lines in e and i). It is not period/2π: the R-weighted mean of a single sinusoid
   on this grid is 0.8–1.7 × period/2π, and noise pulls weight to the finest scales.
 - **At low noise the error is the phantom's own floor**: the same replicates without
   noise give the same error, replicate by replicate (0.04–0.12° for d ≥ 4, 0.5–1° at
