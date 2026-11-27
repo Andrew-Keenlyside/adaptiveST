@@ -1,7 +1,9 @@
-# adaptiveST
-
+> [!NOTE]
 > This work is derived from a collaboration with Isabella Hezhao
-> ([Structure_Tensor_HiP-CT](https://github.com/1ssot0pe/Structure_Tensor_HiP-CT)).
+> ([@1ssot0pe](https://github.com/1ssot0pe)):
+> [Structure_Tensor_HiP-CT](https://github.com/1ssot0pe/Structure_Tensor_HiP-CT).
+
+# adaptiveST
 
 3D structure tensors for volumetric images, at fixed scales or with **each voxel's
 own derivative scale σ and integration scale ρ, chosen from the image itself**.
